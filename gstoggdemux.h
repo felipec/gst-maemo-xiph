@@ -114,6 +114,7 @@ struct _GstOggPad
   gboolean is_eos;
 
   gboolean added;
+  GstTagList *taglist;
 };
 
 struct _GstOggPadClass

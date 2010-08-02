@@ -161,6 +161,8 @@ gst_ogg_pad_init (GstOggPad * pad)
   pad->continued = NULL;
   pad->map.headers = NULL;
   pad->map.queued = NULL;
+
+  pad->taglist = NULL;
 }
 
 static void
@@ -185,6 +187,9 @@ gst_ogg_pad_dispose (GObject * object)
   g_list_foreach (pad->continued, (GFunc) gst_ogg_page_free, NULL);
   g_list_free (pad->continued);
   pad->continued = NULL;
+
+  gst_tag_list_free (pad->taglist);
+  pad->taglist = NULL;
 
   ogg_stream_reset (&pad->map.stream);
 
@@ -474,8 +479,7 @@ gst_ogg_demux_chain_peer (GstOggPad * pad, ogg_packet * packet,
 
       if (tags) {
         GST_DEBUG_OBJECT (ogg, "tags = %" GST_PTR_FORMAT, tags);
-        gst_element_found_tags_for_pad (GST_ELEMENT (ogg), GST_PAD_CAST (pad),
-            tags);
+        pad->taglist = tags;
       } else {
         GST_DEBUG_OBJECT (ogg, "failed to extract tags from vorbis comment");
       }
@@ -512,8 +516,7 @@ gst_ogg_demux_chain_peer (GstOggPad * pad, ogg_packet * packet,
 
       if (tags) {
         GST_DEBUG_OBJECT (ogg, "tags = %" GST_PTR_FORMAT, tags);
-        gst_element_found_tags_for_pad (GST_ELEMENT (ogg), GST_PAD_CAST (pad),
-            tags);
+        pad->taglist = tags;
       } else {
         GST_DEBUG_OBJECT (ogg,
             "failed to extract VP8 tags from vorbis comment");
@@ -545,8 +548,7 @@ gst_ogg_demux_chain_peer (GstOggPad * pad, ogg_packet * packet,
 
       if (tags) {
         GST_DEBUG_OBJECT (ogg, "tags = %" GST_PTR_FORMAT, tags);
-        gst_element_found_tags_for_pad (GST_ELEMENT (ogg), GST_PAD_CAST (pad),
-            tags);
+        pad->taglist = tags;
       } else {
         GST_DEBUG_OBJECT (ogg, "failed to extract tags from vorbis comment");
       }
@@ -1812,6 +1814,11 @@ gst_ogg_demux_activate_chain (GstOggDemux * ogg, GstOggChain * chain,
 
     gst_element_add_pad (GST_ELEMENT (ogg), GST_PAD_CAST (pad));
     pad->added = TRUE;
+
+    if (event && pad->taglist) {
+      gst_element_found_tags_for_pad (GST_ELEMENT_CAST (ogg),
+          GST_PAD_CAST (pad), pad->taglist);
+    }
   }
   /* prefer the index bitrate over the ones encoded in the streams */
   ogg->bitrate = (idx_bitrate ? idx_bitrate : bitrate);

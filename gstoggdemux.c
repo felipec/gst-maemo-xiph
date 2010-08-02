@@ -530,6 +530,27 @@ gst_ogg_demux_chain_peer (GstOggPad * pad, ogg_packet * packet,
     offset = 0;
     trim = 0;
   } else {
+    const guint8 *data = packet->packet;
+    if (data[0] == 0x03) {
+      GstTagList *tags;
+
+      buf = gst_buffer_new ();
+      GST_BUFFER_DATA (buf) = data;
+      GST_BUFFER_SIZE (buf) = packet->bytes;
+
+      tags = gst_tag_list_from_vorbiscomment_buffer (buf, data, 7, NULL);
+
+      gst_buffer_unref (buf);
+      buf = NULL;
+
+      if (tags) {
+        GST_DEBUG_OBJECT (ogg, "tags = %" GST_PTR_FORMAT, tags);
+        gst_element_found_tags_for_pad (GST_ELEMENT (ogg), GST_PAD_CAST (pad),
+            tags);
+      } else {
+        GST_DEBUG_OBJECT (ogg, "failed to extract tags from vorbis comment");
+      }
+    }
     offset = 0;
     trim = 0;
   }

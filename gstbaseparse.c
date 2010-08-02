@@ -1079,6 +1079,10 @@ gst_base_parse_push_buffer (GstBaseParse * parse, GstBuffer * buffer)
     parse->pending_segment =
         gst_event_new_new_segment (FALSE, parse->segment.rate,
         parse->segment.format, last_start, -1, last_start);
+    if (parse->tags) {
+	    gst_element_found_tags (GST_ELEMENT (parse), parse->tags);
+	    parse->tags = NULL;
+    }
   }
 
   /* and should then also be linked downstream, so safe to send some events */

@@ -1030,6 +1030,9 @@ gst_flac_parse_handle_vorbiscomment (GstFlacParse * flacparse,
     flacparse->tags = NULL;
   }
 
+  if (flacparse->tags)
+	  GST_BASE_PARSE (flacparse)->tags = gst_tag_list_copy(flacparse->tags);
+
   return TRUE;
 }
 

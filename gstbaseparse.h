@@ -145,6 +145,7 @@ struct _GstBaseParse {
   /*< private >*/
   gpointer       _gst_reserved[GST_PADDING_LARGE];
   GstBaseParsePrivate *priv;
+  GstTagList *tags;
 };
 
 /**

@@ -791,7 +791,7 @@ gst_flac_parse_get_frame_size (GstFlacParse * flacparse, GstBuffer * buffer,
 
 need_more_data:
   {
-    gint max;
+    unsigned max;
 
     /* not enough, if that was all available, give up on frame */
     if (G_UNLIKELY (gst_base_parse_get_drain (GST_BASE_PARSE_CAST (flacparse))))
@@ -800,8 +800,7 @@ need_more_data:
     max = flacparse->max_framesize;
     if (!max)
       max = 1 << 24;
-    flacparse->requested_frame_size
-        = MIN (GST_BUFFER_SIZE (buffer) + 4096, max);
+    flacparse->requested_frame_size = MIN (GST_BUFFER_SIZE (buffer) + 4096, max);
     if (flacparse->requested_frame_size > GST_BUFFER_SIZE (buffer)) {
       GST_DEBUG_OBJECT (flacparse, "Requesting %u bytes",
           flacparse->requested_frame_size);
@@ -882,7 +881,7 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
         if (!gst_base_parse_get_sync (parse) &&
             !gst_base_parse_get_drain (parse)) {
           GST_DEBUG_OBJECT (flacparse, "Resyncing; checking next sync code");
-          if (GST_BUFFER_SIZE (buffer) >= ret + 2) {
+          if (GST_BUFFER_SIZE (buffer) >= (unsigned) ret + 2) {
             if (data[ret] == 0xff && (data[ret + 1] >> 2) == 0x3e) {
               GST_DEBUG_OBJECT (flacparse, "Found next sync code");
               return TRUE;
@@ -1087,7 +1086,7 @@ error:
 static void
 _value_array_append_buffer (GValue * array_val, GstBuffer * buf)
 {
-  GValue value = { 0, };
+  GValue value = { .g_type = 0 };
 
   g_value_init (&value, GST_TYPE_BUFFER);
   /* copy buffer to avoid problems with circular refcounts */
@@ -1106,7 +1105,7 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
   GstBuffer *vorbiscomment = NULL;
   GstBuffer *streaminfo = NULL;
   GstBuffer *marker = NULL;
-  GValue array = { 0, };
+  GValue array = { .g_type = 0 };
   GstCaps *caps;
   GList *l;
 

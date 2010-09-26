@@ -303,153 +303,153 @@ gst_flac_parse_stop (GstBaseParse * parse)
   return TRUE;
 }
 
-static int64_t get_utf8 (GetBitContext *s)
+static int64_t get_utf8(GetBitContext *s)
 {
-  int64_t val;
-  int ones;
+	int64_t val;
+	int ones;
 
-  for (ones = 0; get_bits1 (s); ones++);
-  if (ones == 1 || ones >= 8)
-    return -1;
+	for (ones = 0; get_bits1(s); ones++);
+	if (ones == 1 || ones >= 8)
+		return -1;
 
-  val = get_bits (s, 7 - ones);
+	val = get_bits(s, 7 - ones);
 
-  while (--ones > 0) {
-    int tmp = get_bits (s, 8) - 128;
-    if (tmp >> 6)
-      return -1;
-    val = (val << 6) + tmp;
-  }
-  return val;
+	while (--ones > 0) {
+		int tmp = get_bits(s, 8) - 128;
+		if (tmp >> 6)
+			return -1;
+		val = (val << 6) + tmp;
+	}
+	return val;
 }
 
-static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
+static bool frame_header_is_valid(GstFlacParse *flacparse, const uint8_t *buf)
 {
-  GetBitContext s;
-  int bs_code, sr_code, bps_code;
-  int channels, ch_mode;
-  int bps;
-  int is_var_size;
-  int blocksize, samplerate;
-  int64_t sample_num;
-  guint8 actual_crc, expected_crc;
+	GetBitContext s;
+	int bs_code, sr_code, bps_code;
+	int channels, ch_mode;
+	int bps;
+	int is_var_size;
+	int blocksize, samplerate;
+	int64_t sample_num;
+	guint8 actual_crc, expected_crc;
 
-  init_get_bits (&s, buf, FLAC_MAX_FRAME_HEADER_SIZE * 8);
+	init_get_bits(&s, buf, FLAC_MAX_FRAME_HEADER_SIZE * 8);
 
-  /* frame sync code */
-  if ((get_bits (&s, 15) & 0x7fff) != 0x7ffc)
-    return false;
+	/* frame sync code */
+	if ((get_bits(&s, 15) & 0x7fff) != 0x7ffc)
+		return false;
 
-  /* uses fixed size stream code */
-  is_var_size = get_bits1 (&s);
+	/* uses fixed size stream code */
+	is_var_size = get_bits1(&s);
 
-  /* block size and sample rate codes */
-  bs_code = get_bits (&s, 4);
-  sr_code = get_bits (&s, 4);
+	/* block size and sample rate codes */
+	bs_code = get_bits(&s, 4);
+	sr_code = get_bits(&s, 4);
 
-  /* channels and decorrelation */
-  ch_mode = get_bits (&s, 4);
-  if (ch_mode < FLAC_MAX_CHANNELS) {
-    channels = ch_mode + 1;
-  } else if (ch_mode <= FLAC_CHMODE_MID_SIDE) {
-    channels = 2;
-  } else {
-    return false;
-  }
+	/* channels and decorrelation */
+	ch_mode = get_bits(&s, 4);
+	if (ch_mode < FLAC_MAX_CHANNELS) {
+		channels = ch_mode + 1;
+	} else if (ch_mode <= FLAC_CHMODE_MID_SIDE) {
+		channels = 2;
+	} else {
+		return false;
+	}
 
-  /* bits per sample */
-  bps_code = get_bits (&s, 3);
-  if (bps_code == 3 || bps_code == 7)
-    return false;
-  bps = sample_size_table[bps_code];
+	/* bits per sample */
+	bps_code = get_bits(&s, 3);
+	if (bps_code == 3 || bps_code == 7)
+		return false;
+	bps = sample_size_table[bps_code];
 
-  /* reserved bit */
-  if (get_bits1 (&s))
-    return false;
+	/* reserved bit */
+	if (get_bits1(&s))
+		return false;
 
-  /* sample or frame count */
-  sample_num = get_utf8 (&s);
-  if (sample_num < 0)
-    return false;
+	/* sample or frame count */
+	sample_num = get_utf8(&s);
+	if (sample_num < 0)
+		return false;
 
-  /* blocksize */
-  if (bs_code == 0) {
-    return false;
-  } else if (bs_code == 6) {
-    blocksize = get_bits (&s, 8) + 1;
-  } else if (bs_code == 7) {
-    blocksize = get_bits (&s, 16) + 1;
-  } else {
-    blocksize = blocksize_table[bs_code];
-  }
+	/* blocksize */
+	if (bs_code == 0) {
+		return false;
+	} else if (bs_code == 6) {
+		blocksize = get_bits(&s, 8) + 1;
+	} else if (bs_code == 7) {
+		blocksize = get_bits(&s, 16) + 1;
+	} else {
+		blocksize = blocksize_table[bs_code];
+	}
 
-  /* sample rate */
-  if (sr_code < 12) {
-    samplerate = sample_rate_table[sr_code];
-  } else if (sr_code == 12) {
-    samplerate = get_bits (&s, 8) * 1000;
-  } else if (sr_code == 13) {
-    samplerate = get_bits (&s, 16);
-  } else if (sr_code == 14) {
-    samplerate = get_bits (&s, 16) * 10;
-  } else {
-    return false;
-  }
+	/* sample rate */
+	if (sr_code < 12) {
+		samplerate = sample_rate_table[sr_code];
+	} else if (sr_code == 12) {
+		samplerate = get_bits(&s, 8) * 1000;
+	} else if (sr_code == 13) {
+		samplerate = get_bits(&s, 16);
+	} else if (sr_code == 14) {
+		samplerate = get_bits(&s, 16) * 10;
+	} else {
+		return false;
+	}
 
-  /* header CRC-8 check */
-  expected_crc = get_bits (&s, 8);
-  actual_crc = gst_flac_calculate_crc8 (buf, get_bits_count (&s) / 8 - 1);
-  if (actual_crc != expected_crc)
-    return false;
+	/* header CRC-8 check */
+	expected_crc = get_bits(&s, 8);
+	actual_crc = gst_flac_calculate_crc8(buf, get_bits_count(&s) / 8 - 1);
+	if (actual_crc != expected_crc)
+		return false;
 
-  flacparse->block_size = blocksize;
-  if (!flacparse->samplerate)
-    flacparse->samplerate = samplerate;
-  if (!flacparse->bps)
-    flacparse->bps = bps;
-  if (!flacparse->blocking_strategy)
-    flacparse->blocking_strategy = is_var_size;
-  if (!flacparse->channels)
-    flacparse->channels = channels;
-  if (!flacparse->sample_number)
-    flacparse->sample_number = sample_num;
+	flacparse->block_size = blocksize;
+	if (!flacparse->samplerate)
+		flacparse->samplerate = samplerate;
+	if (!flacparse->bps)
+		flacparse->bps = bps;
+	if (!flacparse->blocking_strategy)
+		flacparse->blocking_strategy = is_var_size;
+	if (!flacparse->channels)
+		flacparse->channels = channels;
+	if (!flacparse->sample_number)
+		flacparse->sample_number = sample_num;
 
-  return true;
+	return true;
 }
 
 static bool
-get_next_sync (GstFlacParse *flacparse, const uint8_t *buffer, size_t size, unsigned *ret)
+get_next_sync(GstFlacParse *flacparse, const uint8_t *buffer, size_t size, unsigned *ret)
 {
-  unsigned max;
-  unsigned i, search_start, search_end;
+	unsigned max;
+	unsigned i, search_start, search_end;
 
-  if (size <= flacparse->min_framesize)
-    goto need_more;
+	if (size <= flacparse->min_framesize)
+		goto need_more;
 
-  if (!frame_header_is_valid (flacparse, buffer)) {
-    *ret = 0;
-    return false;
-  }
+	if (!frame_header_is_valid(flacparse, buffer)) {
+		*ret = 0;
+		return false;
+	}
 
-  search_start = MAX (2, flacparse->min_framesize);
-  search_end = MIN (size, flacparse->max_framesize);
-  search_end -= (FLAC_MAX_FRAME_HEADER_SIZE - 1);
+	search_start = MAX(2, flacparse->min_framesize);
+	search_end = MIN(size, flacparse->max_framesize);
+	search_end -= (FLAC_MAX_FRAME_HEADER_SIZE - 1);
 
-  for (i = search_start; i < search_end; i++) {
-    if ((AV_RB16 (buffer + i) & 0xfffe) == 0xfff8 &&
-        frame_header_is_valid (flacparse, buffer + i))
-    {
-      *ret = i;
-      return true;
-    }
-  }
+	for (i = search_start; i < search_end; i++) {
+		if ((AV_RB16(buffer + i) & 0xfffe) == 0xfff8 &&
+				frame_header_is_valid(flacparse, buffer + i))
+		{
+			*ret = i;
+			return true;
+		}
+	}
 
 need_more:
-  max = flacparse->max_framesize;
-  if (!max)
-    max = 1 << 24;
-  *ret = MIN (size + 4096, max);
-  return false;
+	max = flacparse->max_framesize;
+	if (!max)
+		max = 1 << 24;
+	*ret = MIN(size + 4096, max);
+	return false;
 }
 
 static gboolean

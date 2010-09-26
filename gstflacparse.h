@@ -54,9 +54,6 @@ typedef struct {
 struct _GstFlacParse {
   GstBaseParse parent;
 
-  /* Properties */
-  gboolean check_frame_checksums;
-
   GstFlacParseState state;
 
   gint64 upstream_length;
@@ -68,8 +65,6 @@ struct _GstFlacParse {
   guint8 channels;
   guint8 bps;
   guint64 total_samples;
-
-  guint requested_frame_size;
 
   /* Current frame */
   guint64 offset;

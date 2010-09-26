@@ -552,218 +552,34 @@ static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
   return parse_frame_header_base (flacparse, &reader);
 }
 
-static gint
-gst_flac_parse_get_frame_size (GstFlacParse * flacparse, GstBuffer * buffer,
-    guint * framesize_ret)
+static bool
+get_next_sync (GstFlacParse *flacparse, const uint8_t *buffer, size_t size, unsigned *ret)
 {
-  GstBitReader reader = GST_BIT_READER_INIT_FROM_BUFFER (buffer);
-  guint8 tmp;
-  gint i;
-  guint8 channel_assignment;
+  unsigned max;
+  unsigned i, search_start, search_end;
 
-  if (!parse_frame_header_base (flacparse, &reader))
-    goto error;
+  if (size <= flacparse->min_framesize)
+    goto need_more;
 
-  channel_assignment = flacparse->channel_assignment;
+  search_start = MAX (2, flacparse->min_framesize);
+  search_end = MIN (size, flacparse->max_framesize);
+  search_end -= (FLAC_MAX_FRAME_HEADER_SIZE - 1);
 
-  /* parse subframes, one subframe per channel */
-  for (i = 0; i < flacparse->channels; i++) {
-    guint8 sf_type;
-    guint8 cur_bps;
-
-    cur_bps = flacparse->bps;
-
-    /* for mid/side, left/side, right/side the "difference" channel
-     * needs and additional bit */
-    if (i == 0 && channel_assignment == 2)
-      cur_bps++;
-    else if (i == 1 && (channel_assignment == 1 || channel_assignment == 3))
-      cur_bps++;
-
-    /* must be 0 */
-    if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-      goto need_more_data;
-    else if (tmp != 0)
-      goto error;
-
-    /* sub frame type */
-    if (!gst_bit_reader_get_bits_uint8 (&reader, &sf_type, 6))
-      goto need_more_data;
-    else if (((sf_type & 0xfe) == 0x02) ||
-        ((sf_type & 0xfc) == 0x04) ||
-        ((sf_type & 0xf8) == 0x08 && (sf_type & 0x07) > 4) ||
-        ((sf_type & 0xf0) == 0x10))
-      goto error;
-
-    /* wasted bits per sample, if 1 the value follows unary coded */
-    if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1)) {
-      goto need_more_data;
-    } else if (tmp != 0) {
-      guint wasted = 1;
-
-      tmp = 0;
-      while (tmp == 0) {
-        if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-          goto need_more_data;
-        else
-          wasted++;
-      }
-      cur_bps -= wasted;
-    }
-
-    /* subframe type: constant */
-    if (sf_type == 0x00) {
-      if (!gst_bit_reader_skip (&reader, cur_bps))
-        goto need_more_data;
-      /* subframe type: verbatim */
-    } else if (sf_type == 0x01) {
-      if (!gst_bit_reader_skip (&reader, cur_bps * flacparse->block_size))
-        goto need_more_data;
-      /* subframe type: LPC or fixed */
-    } else {
-      guint8 residual_type;
-      guint order = 0;
-      guint16 partition_order;
-      guint j;
-
-      /* Skip warm-up samples for fixed subframe and calculate order */
-      if ((sf_type & 0xf8) == 0x08) {
-        order = sf_type & 0x07;
-
-        g_assert (order <= 4);
-
-        if (!gst_bit_reader_skip (&reader, cur_bps * order))
-          goto need_more_data;
-        /* Skip warm-up samples for LPC subframe, get parameters and calculate order */
-      } else if ((sf_type & 0xe0) == 0x20) {
-        guint8 prec;
-
-        order = (sf_type & 0x1f) + 1;
-
-        /* warm-up samples */
-        if (!gst_bit_reader_skip (&reader, cur_bps * order))
-          goto need_more_data;
-
-        /* LPC coefficient precision */
-        if (!gst_bit_reader_get_bits_uint8 (&reader, &prec, 4))
-          goto need_more_data;
-        else if (prec == 0x0f)
-          goto error;
-        prec++;
-
-        /* LPC coefficient shift */
-        if (!gst_bit_reader_skip (&reader, 5))
-          goto need_more_data;
-
-        /* LPC coefficients */
-        if (!gst_bit_reader_skip (&reader, order * prec))
-          goto need_more_data;
-      } else {
-        g_assert_not_reached ();
-      }
-
-      /* residual type: 0 == rice, 1 == rice2 */
-      if (!gst_bit_reader_get_bits_uint8 (&reader, &residual_type, 2))
-        goto need_more_data;
-
-      if (residual_type & 0x02)
-        goto error;
-
-      /* partition order */
-      if (!gst_bit_reader_get_bits_uint16 (&reader, &partition_order, 4))
-        goto need_more_data;
-
-      partition_order = 1 << partition_order;
-
-      /* 2^partition_order partitions */
-      for (j = 0; j < partition_order; j++) {
-        guint samples;
-        guint8 rice_parameter;
-
-        /* calculate number of samples for the current partition */
-        if (partition_order == 1) {
-          samples = flacparse->block_size - order;
-        } else if (j != 0) {
-          samples = flacparse->block_size / partition_order;
-        } else {
-          samples = flacparse->block_size / partition_order - order;
-        }
-
-        /* rice parameter */
-        if (!gst_bit_reader_get_bits_uint8 (&reader, &rice_parameter,
-                (residual_type == 0) ? 4 : 5))
-          goto need_more_data;
-
-        /* if rice parameter has all bits set the samples follow unencoded with the number of bits
-         * per sample in the following 5 bits */
-        if ((residual_type == 0 && rice_parameter == 0x0f)
-            || (residual_type == 1 && rice_parameter == 0x1f)) {
-          if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 5))
-            goto need_more_data;
-          if (!gst_bit_reader_skip (&reader, tmp * samples))
-            goto need_more_data;
-        } else {
-          guint k;
-
-          /* read the rice encoded samples */
-          for (k = 0; k < samples; k++) {
-            tmp = 0;
-            while (tmp == 0)
-              if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-                goto need_more_data;
-
-            if (!gst_bit_reader_skip (&reader, rice_parameter))
-              goto need_more_data;
-          }
-        }
-      }
+  for (i = search_start; i < search_end; i++) {
+    if ((GST_READ_UINT16_BE (buffer + i) & 0xfffe) == 0xfff8 &&
+        frame_header_is_valid (flacparse, buffer + i))
+    {
+      *ret = i;
+      return true;
     }
   }
 
-  /* zero padding to byte alignment */
-  gst_bit_reader_skip_to_byte (&reader);
-
-  /* Skip crc-16 for the complete frame */
-  if (!gst_bit_reader_skip (&reader, 16))
-    goto need_more_data;
-
-  *framesize_ret = gst_bit_reader_get_pos (&reader) / 8;
-
-  GST_DEBUG_OBJECT (flacparse, "Parsed frame at offset %" G_GUINT64_FORMAT ":\n"
-      "Frame size: %u\n"
-      "Block size: %u\n"
-      "Sample/Frame number: %" G_GUINT64_FORMAT,
-      flacparse->offset, *framesize_ret,
-      flacparse->block_size, flacparse->sample_number);
-
-  return 0;
-
-need_more_data:
-  {
-    unsigned max, next;
-
-    /* not enough, if that was all available, give up on frame */
-    if (G_UNLIKELY (gst_base_parse_get_drain (GST_BASE_PARSE_CAST (flacparse)))) {
-      GST_WARNING_OBJECT (flacparse, "EOS");
-      return -1;
-    }
-    /* otherwise, ask for some more */
-    max = flacparse->max_framesize;
-    if (!max)
-      max = 1 << 24;
-    next = MIN (GST_BUFFER_SIZE (buffer) + 4096, max);
-    if (next > GST_BUFFER_SIZE (buffer)) {
-      GST_DEBUG_OBJECT (flacparse, "Requesting %u bytes", next);
-      return next;
-    } else {
-      GST_DEBUG_OBJECT (flacparse, "Giving up on invalid frame (%d bytes)",
-          GST_BUFFER_SIZE (buffer));
-      return -1;
-    }
-  }
-
-error:
-    return -1;
+need_more:
+  max = flacparse->max_framesize;
+  if (!max)
+    max = 1 << 24;
+  *ret = MIN (size + 4096, max);
+  return false;
 }
 
 static gboolean
@@ -800,7 +616,7 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
     return TRUE;
   } else {
     if (data[0] == 0xff && (data[1] >> 2) == 0x3e) {
-      gint ret = 0;
+      unsigned next;
 
       flacparse->offset = GST_BUFFER_OFFSET (buffer);
       flacparse->blocking_strategy = 0;
@@ -808,9 +624,10 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
       flacparse->sample_number = 0;
 
       GST_DEBUG_OBJECT (flacparse, "Found sync code");
-      ret = gst_flac_parse_get_frame_size (flacparse, buffer, framesize);
-      if (ret == 0) {
-        ret = *framesize;
+      if (get_next_sync (flacparse, buffer->data, buffer->size, &next)) {
+        gint ret = 0;
+        GST_DEBUG_OBJECT (flacparse, "Found next sync code");
+        *framesize = ret = next;
         /* if not in sync, also check for next frame header */
         if (!gst_base_parse_get_sync (parse) &&
             !gst_base_parse_get_drain (parse)) {
@@ -833,12 +650,22 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
           }
         }
         return TRUE;
-      } else if (ret > 0) {
-        *skipsize = 0;
-        gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), ret);
-        return FALSE;
       } else {
-        return FALSE;
+        /* not enough, if that was all available, give up on frame */
+        if (G_UNLIKELY (gst_base_parse_get_drain (parse))) {
+          GST_WARNING_OBJECT (flacparse, "EOS");
+          return FALSE;
+        }
+
+        if (next > buffer->size) {
+          GST_DEBUG_OBJECT (flacparse, "Requesting %u bytes", next);
+          *skipsize = 0;
+          gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), next);
+          return FALSE;
+        } else {
+          GST_DEBUG_OBJECT (flacparse, "Giving up on invalid frame (%d bytes)", buffer->size);
+          return FALSE;
+        }
       }
     } else {
       GstByteReader reader = GST_BYTE_READER_INIT_FROM_BUFFER (buffer);

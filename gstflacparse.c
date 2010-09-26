@@ -485,7 +485,7 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
     *framesize = size;
     return TRUE;
   } else {
-    if (data[0] == 0xff && (data[1] >> 2) == 0x3e) {
+    if ((AV_RB16(data) & 0xfffe) == 0xfff8) {
       unsigned next;
 
       flacparse->offset = buffer->offset;

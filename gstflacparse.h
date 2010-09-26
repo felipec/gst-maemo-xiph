@@ -75,8 +75,6 @@ struct _GstFlacParse {
   GstTagList *tags;
 
   GList *headers;
-
-  guint8 channel_assignment;
 };
 
 struct _GstFlacParseClass {

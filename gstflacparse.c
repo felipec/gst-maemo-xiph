@@ -63,7 +63,7 @@
 #include <gst/base/gstbytereader.h>
 
 #include <stdbool.h>
-#include <stdint.h>
+#include "get_bits.h"
 
 GST_DEBUG_CATEGORY_STATIC (flacparse_debug);
 #define GST_CAT_DEFAULT flacparse_debug
@@ -303,26 +303,19 @@ gst_flac_parse_stop (GstBaseParse * parse)
   return TRUE;
 }
 
-static int64_t get_utf8 (GstBitReader *s)
+static int64_t get_utf8 (GetBitContext *s)
 {
   int64_t val;
-  int ones = 0;
-  uint16_t tmp;
+  int ones;
 
-  for (tmp = 1; tmp;) {
-    gst_bit_reader_get_bits_uint16 (s, &tmp, 1);
-    if (tmp == 1)
-      ones++;
-  }
+  for (ones = 0; get_bits1 (s); ones++);
   if (ones == 1 || ones >= 8)
     return -1;
 
-  gst_bit_reader_get_bits_uint16 (s, &tmp, 7 - ones);
-  val = tmp;
+  val = get_bits (s, 7 - ones);
 
   while (--ones > 0) {
-    gst_bit_reader_get_bits_uint16 (s, &tmp, 8);
-    tmp -= 128;
+    int tmp = get_bits (s, 8) - 128;
     if (tmp >> 6)
       return -1;
     val = (val << 6) + tmp;
@@ -332,8 +325,7 @@ static int64_t get_utf8 (GstBitReader *s)
 
 static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
 {
-  GstBitReader s = { .data = buf, .size = FLAC_MAX_FRAME_HEADER_SIZE };
-  guint16 tmp;
+  GetBitContext s;
   int bs_code, sr_code, bps_code;
   int channels, ch_mode;
   int bps;
@@ -342,24 +334,21 @@ static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
   int64_t sample_num;
   guint8 actual_crc, expected_crc;
 
+  init_get_bits (&s, buf, FLAC_MAX_FRAME_HEADER_SIZE * 8);
+
   /* frame sync code */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 15);
-  if ((tmp & 0x7fff) != 0x7ffc)
+  if ((get_bits (&s, 15) & 0x7fff) != 0x7ffc)
     return false;
 
   /* uses fixed size stream code */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 1);
-  is_var_size = tmp;
+  is_var_size = get_bits1 (&s);
 
   /* block size and sample rate codes */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
-  bs_code = tmp;
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
-  sr_code = tmp;
+  bs_code = get_bits (&s, 4);
+  sr_code = get_bits (&s, 4);
 
   /* channels and decorrelation */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
-  ch_mode = tmp;
+  ch_mode = get_bits (&s, 4);
   if (ch_mode < FLAC_MAX_CHANNELS) {
     channels = ch_mode + 1;
   } else if (ch_mode <= FLAC_CHMODE_MID_SIDE) {
@@ -369,19 +358,17 @@ static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
   }
 
   /* bits per sample */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 3);
-  bps_code = tmp;
+  bps_code = get_bits (&s, 3);
   if (bps_code == 3 || bps_code == 7)
     return false;
   bps = sample_size_table[bps_code];
 
   /* reserved bit */
-  gst_bit_reader_get_bits_uint16 (&s, &tmp, 1);
-  if (tmp)
+  if (get_bits1 (&s))
     return false;
 
   /* sample or frame count */
-  sample_num = get_utf8(&s);
+  sample_num = get_utf8 (&s);
   if (sample_num < 0)
     return false;
 
@@ -389,11 +376,9 @@ static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
   if (bs_code == 0) {
     return false;
   } else if (bs_code == 6) {
-    gst_bit_reader_get_bits_uint16 (&s, &tmp, 8);
-    blocksize = tmp + 1;
+    blocksize = get_bits (&s, 8) + 1;
   } else if (bs_code == 7) {
-    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
-    blocksize = tmp + 1;
+    blocksize = get_bits (&s, 16) + 1;
   } else {
     blocksize = blocksize_table[bs_code];
   }
@@ -402,21 +387,18 @@ static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
   if (sr_code < 12) {
     samplerate = sample_rate_table[sr_code];
   } else if (sr_code == 12) {
-    gst_bit_reader_get_bits_uint16 (&s, &tmp, 8);
-    samplerate = tmp * 1000;
+    samplerate = get_bits (&s, 8) * 1000;
   } else if (sr_code == 13) {
-    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
-    samplerate = tmp;
+    samplerate = get_bits (&s, 16);
   } else if (sr_code == 14) {
-    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
-    samplerate = tmp * 10;
+    samplerate = get_bits (&s, 16) * 10;
   } else {
     return false;
   }
 
   /* header CRC-8 check */
-  gst_bit_reader_get_bits_uint8 (&s, &expected_crc, 8);
-  actual_crc = gst_flac_calculate_crc8 (buf, (gst_bit_reader_get_pos (&s) / 8) - 1);
+  expected_crc = get_bits (&s, 8);
+  actual_crc = gst_flac_calculate_crc8 (buf, get_bits_count (&s) / 8 - 1);
   if (actual_crc != expected_crc)
     return false;
 
@@ -454,7 +436,7 @@ get_next_sync (GstFlacParse *flacparse, const uint8_t *buffer, size_t size, unsi
   search_end -= (FLAC_MAX_FRAME_HEADER_SIZE - 1);
 
   for (i = search_start; i < search_end; i++) {
-    if ((GST_READ_UINT16_BE (buffer + i) & 0xfffe) == 0xfff8 &&
+    if ((AV_RB16 (buffer + i) & 0xfffe) == 0xfff8 &&
         frame_header_is_valid (flacparse, buffer + i))
     {
       *ret = i;

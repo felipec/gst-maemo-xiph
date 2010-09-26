@@ -69,6 +69,22 @@ GST_DEBUG_CATEGORY_STATIC (flacparse_debug);
 #define GST_CAT_DEFAULT flacparse_debug
 
 #define FLAC_MAX_FRAME_HEADER_SIZE 16
+#define FLAC_MAX_CHANNELS 8
+#define FLAC_CHMODE_MID_SIDE 10
+
+static const int8_t sample_size_table[] = { 0, 8, 12, 0, 16, 20, 24, 0 };
+
+static const int16_t blocksize_table[16] = {
+	0, 192, 576 << 0, 576 << 1, 576 << 2, 576 << 3, 0, 0,
+	256 << 0, 256 << 1, 256 << 2, 256 << 3, 256 << 4, 256 << 5, 256 << 6, 256 << 7,
+};
+
+static const int sample_rate_table[16] = {
+	0,
+	88200, 176400, 192000,
+	8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000,
+	0, 0, 0, 0,
+};
 
 /* CRC-8, poly = x^8 + x^2 + x^1 + x^0, init = 0 */
 static const guint8 crc8_table[256] = {
@@ -287,256 +303,136 @@ gst_flac_parse_stop (GstBaseParse * parse)
   return TRUE;
 }
 
+static int64_t get_utf8 (GstBitReader *s)
+{
+  int64_t val;
+  int ones = 0;
+  uint16_t tmp;
+
+  for (tmp = 1; tmp;) {
+    gst_bit_reader_get_bits_uint16 (s, &tmp, 1);
+    if (tmp == 1)
+      ones++;
+  }
+  if (ones == 1 || ones >= 8)
+    return -1;
+
+  gst_bit_reader_get_bits_uint16 (s, &tmp, 7 - ones);
+  val = tmp;
+
+  while (--ones > 0) {
+    gst_bit_reader_get_bits_uint16 (s, &tmp, 8);
+    tmp -= 128;
+    if (tmp >> 6)
+      return -1;
+    val = (val << 6) + tmp;
+  }
+  return val;
+}
+
 static bool frame_header_is_valid (GstFlacParse *flacparse, const uint8_t *buf)
 {
-  GstBitReader reader = { .data = buf, .size = FLAC_MAX_FRAME_HEADER_SIZE };
-  guint16 samplerate;
-  guint8 tmp;
+  GstBitReader s = { .data = buf, .size = FLAC_MAX_FRAME_HEADER_SIZE };
+  guint16 tmp;
+  int bs_code, sr_code, bps_code;
+  int channels, ch_mode;
+  int bps;
+  int is_var_size;
+  int blocksize, samplerate;
+  int64_t sample_num;
   guint8 actual_crc, expected_crc;
 
-  /* Skip 14 bit sync code */
-  if (!gst_bit_reader_skip (&reader, 14))
-    goto need_more_data;
+  /* frame sync code */
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 15);
+  if ((tmp & 0x7fff) != 0x7ffc)
+    return false;
 
-  /* Must be 0 */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-    goto need_more_data;
-  else if (tmp != 0)
-    goto error;
+  /* uses fixed size stream code */
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 1);
+  is_var_size = tmp;
 
-  /* 0 == fixed block size, 1 == variable block size */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &flacparse->blocking_strategy,
-          1))
-    goto need_more_data;
+  /* block size and sample rate codes */
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
+  bs_code = tmp;
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
+  sr_code = tmp;
 
-  /* block size index, calculation of the real blocksize below */
-  if (!gst_bit_reader_get_bits_uint16 (&reader, &flacparse->block_size, 4))
-    goto need_more_data;
-  else if (flacparse->block_size == 0)
-    goto error;
-
-  /* sample rate index, calculation of the real samplerate below */
-  if (!gst_bit_reader_get_bits_uint16 (&reader, &samplerate, 4))
-    goto need_more_data;
-  else if (samplerate == 0x0f)
-    goto error;
-
-  /* channel assignment */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 4)) {
-    goto need_more_data;
-  } else if (tmp < 8) {
-    if (flacparse->channels && tmp + 1 != flacparse->channels)
-      goto error;
-    else
-      flacparse->channels = tmp + 1;
-  } else if (tmp <= 10) {
-    if (flacparse->channels && 2 != flacparse->channels)
-      goto error;
-    else
-      flacparse->channels = 2;
-  } else if (tmp > 10) {
-    goto error;
+  /* channels and decorrelation */
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 4);
+  ch_mode = tmp;
+  if (ch_mode < FLAC_MAX_CHANNELS) {
+    channels = ch_mode + 1;
+  } else if (ch_mode <= FLAC_CHMODE_MID_SIDE) {
+    channels = 2;
+  } else {
+    return false;
   }
 
   /* bits per sample */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 3)) {
-    goto need_more_data;
-  } else if (tmp == 0x03 || tmp == 0x07) {
-    goto error;
-  } else if (tmp == 0 && flacparse->bps == 0) {
-    goto error;
-  } else if (tmp == 0x01 && flacparse->bps != 8) {
-    if (flacparse->bps && flacparse->bps != 8)
-      goto error;
-    else
-      flacparse->bps = 8;
-  } else if (tmp == 0x02 && flacparse->bps != 12) {
-    if (flacparse->bps && flacparse->bps != 12)
-      goto error;
-    else
-      flacparse->bps = 12;
-  } else if (tmp == 0x04 && flacparse->bps != 16) {
-    if (flacparse->bps && flacparse->bps != 16)
-      goto error;
-    else
-      flacparse->bps = 16;
-  } else if (tmp == 0x05 && flacparse->bps != 20) {
-    if (flacparse->bps && flacparse->bps != 20)
-      goto error;
-    else
-      flacparse->bps = 20;
-  } else if (tmp == 0x06 && flacparse->bps != 24) {
-    if (flacparse->bps && flacparse->bps != 24)
-      goto error;
-    else
-      flacparse->bps = 24;
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 3);
+  bps_code = tmp;
+  if (bps_code == 3 || bps_code == 7)
+    return false;
+  bps = sample_size_table[bps_code];
+
+  /* reserved bit */
+  gst_bit_reader_get_bits_uint16 (&s, &tmp, 1);
+  if (tmp)
+    return false;
+
+  /* sample or frame count */
+  sample_num = get_utf8(&s);
+  if (sample_num < 0)
+    return false;
+
+  /* blocksize */
+  if (bs_code == 0) {
+    return false;
+  } else if (bs_code == 6) {
+    gst_bit_reader_get_bits_uint16 (&s, &tmp, 8);
+    blocksize = tmp + 1;
+  } else if (bs_code == 7) {
+    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
+    blocksize = tmp + 1;
+  } else {
+    blocksize = blocksize_table[bs_code];
   }
 
-  /* reserved, must be 0 */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-    goto need_more_data;
-  else if (tmp != 0)
-    goto error;
-
-  /* read "utf8" encoded sample/frame number */
-  {
-    guint len = 0;
-
-    tmp = 1;
-    while (tmp != 0) {
-      if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 1))
-        goto need_more_data;
-      else if (tmp == 1)
-        len++;
-    }
-    if (len == 1)
-      goto error;
-
-    flacparse->sample_number = 0;
-    if (len == 0) {
-      if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 7))
-        goto need_more_data;
-      flacparse->sample_number = tmp;
-    } else if ((flacparse->blocking_strategy == 0 && len > 6) ||
-        (flacparse->blocking_strategy == 1 && len > 7)) {
-      goto error;
-    } else {
-      if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 8 - len - 1))
-        goto need_more_data;
-
-      flacparse->sample_number = tmp;
-      len -= 1;
-
-      while (len > 0) {
-        if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 2))
-          goto need_more_data;
-        else if (tmp != 0x02)
-          goto error;
-
-        if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 6))
-          goto need_more_data;
-        flacparse->sample_number <<= 6;
-        flacparse->sample_number |= tmp;
-        len--;
-      }
-    }
+  /* sample rate */
+  if (sr_code < 12) {
+    samplerate = sample_rate_table[sr_code];
+  } else if (sr_code == 12) {
+    gst_bit_reader_get_bits_uint16 (&s, &tmp, 8);
+    samplerate = tmp * 1000;
+  } else if (sr_code == 13) {
+    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
+    samplerate = tmp;
+  } else if (sr_code == 14) {
+    gst_bit_reader_get_bits_uint16 (&s, &tmp, 16);
+    samplerate = tmp * 10;
+  } else {
+    return false;
   }
 
-  /* calculate real blocksize from the blocksize index */
-  if (flacparse->block_size == 1)
-    flacparse->block_size = 192;
-  else if (flacparse->block_size <= 5)
-    flacparse->block_size = 576 * (1 << (flacparse->block_size - 2));
-  else if (flacparse->block_size <= 15)
-    flacparse->block_size = 256 * (1 << (flacparse->block_size - 8));
-  else if (flacparse->block_size == 6) {
-    if (!gst_bit_reader_get_bits_uint16 (&reader, &flacparse->block_size, 8))
-      goto need_more_data;
-    flacparse->block_size++;
-  } else if (flacparse->block_size == 7) {
-    if (!gst_bit_reader_get_bits_uint16 (&reader, &flacparse->block_size, 16))
-      goto need_more_data;
-    flacparse->block_size++;
-  }
-
-  /* calculate the real samplerate from the samplerate index */
-  if (samplerate == 0 && flacparse->samplerate == 0) {
-    goto error;
-  } else if (samplerate == 1) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 88200;
-    else if (flacparse->samplerate != 88200)
-      goto error;
-  } else if (samplerate == 2) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 176400;
-    else if (flacparse->samplerate != 176400)
-      goto error;
-  } else if (samplerate == 3) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 192000;
-    else if (flacparse->samplerate != 192000)
-      goto error;
-  } else if (samplerate == 4) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 8000;
-    else if (flacparse->samplerate != 8000)
-      goto error;
-  } else if (samplerate == 5) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 16000;
-    else if (flacparse->samplerate != 16000)
-      goto error;
-  } else if (samplerate == 6) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 22050;
-    else if (flacparse->samplerate != 22050)
-      goto error;
-  } else if (samplerate == 7) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 24000;
-    else if (flacparse->samplerate != 24000)
-      goto error;
-  } else if (samplerate == 8) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 32000;
-    else if (flacparse->samplerate != 32000)
-      goto error;
-  } else if (samplerate == 9) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 44100;
-    else if (flacparse->samplerate != 44100)
-      goto error;
-  } else if (samplerate == 10) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 48000;
-    else if (flacparse->samplerate != 48000)
-      goto error;
-  } else if (samplerate == 11) {
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = 96000;
-    else if (flacparse->samplerate != 96000)
-      goto error;
-  } else if (samplerate == 12) {
-    if (!gst_bit_reader_get_bits_uint16 (&reader, &samplerate, 8))
-      goto need_more_data;
-    samplerate *= 1000;
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = samplerate;
-    else if (flacparse->samplerate != samplerate)
-      goto error;
-  } else if (samplerate == 13) {
-    if (!gst_bit_reader_get_bits_uint16 (&reader, &samplerate, 16))
-      goto need_more_data;
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = samplerate;
-    else if (flacparse->samplerate != samplerate)
-      goto error;
-  } else if (samplerate == 14) {
-    if (!gst_bit_reader_get_bits_uint16 (&reader, &samplerate, 16))
-      goto need_more_data;
-    samplerate *= 10;
-    if (flacparse->samplerate == 0)
-      flacparse->samplerate = samplerate;
-    else if (flacparse->samplerate != samplerate)
-      goto error;
-  }
-
-  /* check crc-8 for the header */
-  if (!gst_bit_reader_get_bits_uint8 (&reader, &expected_crc, 8))
-    goto need_more_data;
-
-  actual_crc =
-      gst_flac_calculate_crc8 (reader.data,
-      (gst_bit_reader_get_pos (&reader) / 8) - 1);
+  /* header CRC-8 check */
+  gst_bit_reader_get_bits_uint8 (&s, &expected_crc, 8);
+  actual_crc = gst_flac_calculate_crc8 (buf, (gst_bit_reader_get_pos (&s) / 8) - 1);
   if (actual_crc != expected_crc)
-    goto error;
+    return false;
+
+  flacparse->block_size = blocksize;
+  if (!flacparse->samplerate)
+    flacparse->samplerate = samplerate;
+  if (!flacparse->bps)
+    flacparse->bps = bps;
+  if (!flacparse->blocking_strategy)
+    flacparse->blocking_strategy = is_var_size;
+  if (!flacparse->channels)
+    flacparse->channels = channels;
+  if (!flacparse->sample_number)
+    flacparse->sample_number = sample_num;
 
   return true;
-
-need_more_data:
-error:
-  return false;
 }
 
 static bool

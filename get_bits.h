@@ -64,30 +64,21 @@ static inline uint32_t av_bswap32(uint32_t x)
 #define AV_RB16(x) av_bswap16(AV_RN(16, x))
 #define AV_RB32(x) av_bswap32(AV_RN(32, x))
 #elif defined(__arm__)
-static inline uint16_t av_read16(const void *p)
+static inline uint16_t av_read16_be(const uint8_t *p)
 {
 	uint16_t v;
-	__asm__("ldrh %0, %1" : "=r"(v) : "m"(*(const uint16_t *)p));
+	__asm__("ldrh %0, %1\n\trev16 %0, %0" : "=r"(v) : "m"(*(const uint16_t *)p));
 	return v;
 }
-static inline uint32_t av_read32(const void *p)
+static inline uint32_t av_read32_be(const uint8_t *p)
 {
 	uint32_t v;
-	__asm__("ldr  %0, %1" : "=r"(v) : "m"(*(const uint32_t *)p));
+	__asm__("ldr %0, %1" : "=r"(v) : "m"(*(const uint32_t *)p));
+	__asm__("rev %0, %0" : "+r"(v));
 	return v;
 }
-static inline uint16_t av_bswap16(uint16_t x)
-{
-	__asm__("rev16 %0, %0" : "+r"(x));
-	return x;
-}
-static inline uint32_t av_bswap32(uint32_t x)
-{
-	__asm__("rev %0, %0" : "+r"(x));
-	return x;
-}
-#define AV_RB16(x) av_bswap16(av_read16(x))
-#define AV_RB32(x) av_bswap32(av_read32(x))
+#define AV_RB16(x) av_read16_be(x)
+#define AV_RB32(x) av_read32_be(x)
 #endif
 
 #ifndef AV_RB16

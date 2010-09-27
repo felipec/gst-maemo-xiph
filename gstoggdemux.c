@@ -40,7 +40,6 @@
 #include "config.h"
 #endif
 #include <string.h>
-#include <gst/gst-i18n-plugin.h>
 #include <gst/tag/tag.h>
 
 #include "gstoggdemux.h"

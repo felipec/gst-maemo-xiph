@@ -801,18 +801,9 @@ push_headers:
 
   /* push header buffers; update caps, so when we push the first buffer the
    * negotiated caps will change to caps that include the streamheader field */
-  for (l = flacparse->headers; l != NULL; l = l->next) {
-    GstBuffer *buf = GST_BUFFER (l->data);
-    GstFlowReturn ret;
-
-    l->data = NULL;
-    buf = gst_buffer_make_metadata_writable (buf);
-    gst_buffer_set_caps (buf,
-        GST_PAD_CAPS (GST_BASE_PARSE_SRC_PAD (GST_BASE_PARSE (flacparse))));
-
-    ret = gst_base_parse_push_buffer (GST_BASE_PARSE (flacparse), buf);
-    if (ret != GST_FLOW_OK)
-      return FALSE;
+  for (l = flacparse->headers; l; l = l->next) {
+    if (l->data)
+      gst_mini_object_unref (l->data);
   }
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;

@@ -243,14 +243,18 @@ static void
 gst_flac_parse_finalize (GObject * object)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (object);
+  GList *l;
 
   if (flacparse->tags) {
     gst_tag_list_free (flacparse->tags);
     flacparse->tags = NULL;
   }
 
+  for (l = flacparse->headers; l; l = l->next) {
+    if (l->data)
+      gst_mini_object_unref (l->data);
+  }
 
-  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;
 
@@ -290,13 +294,18 @@ static gboolean
 gst_flac_parse_stop (GstBaseParse * parse)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
+  GList *l;
 
   if (flacparse->tags) {
     gst_tag_list_free (flacparse->tags);
     flacparse->tags = NULL;
   }
 
-  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
+  for (l = flacparse->headers; l; l = l->next) {
+    if (l->data)
+      gst_mini_object_unref (l->data);
+  }
+
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;
 

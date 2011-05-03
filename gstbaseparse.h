@@ -24,6 +24,8 @@
 
 #include <gst/gst.h>
 
+#include "hacks.h"
+
 G_BEGIN_DECLS
 
 #define GST_TYPE_BASE_PARSE            (gst_base_parse_get_type())

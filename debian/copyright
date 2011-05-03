@@ -1,0 +1,15 @@
+This package was debianized by Felipe Contreras <felipe.contreras@gmail.com> on
+Wed, 04 May 2011 00:39:03 +0300.
+
+Copyright (C) 2008-2009 Nokia Corporation.
+Copyright (C) 2008 Sebastian Dröge <sebastian.droege@collabora.co.uk>.
+Copyright (C) 2009 Mark Nauwelaerts <mark.nauwelaerts@collabora.co.uk>
+Copyright (C) 2004 Wim Taymans <wim@fluendo.com>
+Copyright (C) 2006 Tim-Philipp Müller <tim centricular net>
+Copyright (C) 2009 David Schleef <ds@schleef.org>
+Copyright (C) 2003 Commonwealth Scientific and Industrial Research Organisation (CSIRO) Australia
+
+License:
+
+This file may be used under the terms of the GNU Lesser General Public License
+version 2.1, a copy of which is found in /usr/share/common-licenses/LGPL.

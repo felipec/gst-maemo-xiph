@@ -1,0 +1,19 @@
+Source: gst-maemo-xiph
+Section: libs
+Priority: optional
+Maintainer: Felipe Contreras <felipe.contreras@gmail.com>
+Build-Depends: debhelper (>= 5), libgstreamer0.10-dev, libgstreamer-plugins-base0.10-dev, libogg-dev
+Standards-Version: 3.9.1
+
+Package: gstreamer0.10-maemo-xiph
+Architecture: armel
+Section: libs
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: GStreamer plug-in for Xiph parsers/demuxers
+
+Package: gstreamer0.10-maemo-xiph-dbg
+Section: debug
+Priority: extra
+Architecture: armel
+Depends: ${misc:Depends}, gstreamer0.10-maemo-xiph (= ${binary:Version})
+Description: Debug symbols for gst-maemo-xiph.

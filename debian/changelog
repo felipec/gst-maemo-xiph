@@ -1,3 +1,9 @@
+gst-maemo-xiph (0.4) fremantle; urgency=low
+
+  * Synchronize with upstream
+
+ -- Felipe Contreras <felipe.contreras@gmail.com>  Wed, 04 May 2011 04:45:31 +0300
+
 gst-maemo-xiph (0.3) fremantle; urgency=low
 
   * Initial release.

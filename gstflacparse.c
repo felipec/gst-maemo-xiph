@@ -62,29 +62,8 @@
 #include <gst/base/gstbitreader.h>
 #include <gst/base/gstbytereader.h>
 
-#include <stdbool.h>
-#include "get_bits.h"
-
 GST_DEBUG_CATEGORY_STATIC (flacparse_debug);
 #define GST_CAT_DEFAULT flacparse_debug
-
-#define FLAC_MAX_FRAME_HEADER_SIZE 16
-#define FLAC_MAX_CHANNELS 8
-#define FLAC_CHMODE_MID_SIDE 10
-
-static const int8_t sample_size_table[] = { 0, 8, 12, 0, 16, 20, 24, 0 };
-
-static const int16_t blocksize_table[16] = {
-	0, 192, 576 << 0, 576 << 1, 576 << 2, 576 << 3, 0, 0,
-	256 << 0, 256 << 1, 256 << 2, 256 << 3, 256 << 4, 256 << 5, 256 << 6, 256 << 7,
-};
-
-static const int sample_rate_table[16] = {
-	0,
-	88200, 176400, 192000,
-	8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000,
-	0, 0, 0, 0,
-};
 
 /* CRC-8, poly = x^8 + x^2 + x^1 + x^0, init = 0 */
 static const guint8 crc8_table[256] = {
@@ -171,6 +150,27 @@ static const guint16 crc16_table[256] = {
   0x8213, 0x0216, 0x021c, 0x8219, 0x0208, 0x820d, 0x8207, 0x0202
 };
 
+static guint16
+gst_flac_calculate_crc16 (const guint8 * data, guint length)
+{
+  guint16 crc = 0;
+
+  while (length--) {
+    crc = ((crc << 8) ^ crc16_table[(crc >> 8) ^ *data]) & 0xffff;
+    data++;
+  }
+
+  return crc;
+}
+
+enum
+{
+  PROP_0,
+  PROP_CHECK_FRAME_CHECKSUMS
+};
+
+#define DEFAULT_CHECK_FRAME_CHECKSUMS FALSE
+
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
@@ -185,15 +185,19 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     );
 
 static void gst_flac_parse_finalize (GObject * object);
+static void gst_flac_parse_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec);
+static void gst_flac_parse_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec);
 
 static gboolean gst_flac_parse_start (GstBaseParse * parse);
 static gboolean gst_flac_parse_stop (GstBaseParse * parse);
 static gboolean gst_flac_parse_check_valid_frame (GstBaseParse * parse,
-    GstBuffer * buffer, guint * framesize, gint * skipsize);
+    GstBaseParseFrame * frame, guint * framesize, gint * skipsize);
 static GstFlowReturn gst_flac_parse_parse_frame (GstBaseParse * parse,
-    GstBuffer * buffer);
-static gint gst_flac_parse_get_frame_overhead (GstBaseParse * parse,
-    GstBuffer * buffer);
+    GstBaseParseFrame * frame);
+static GstFlowReturn gst_flac_parse_pre_push_frame (GstBaseParse * parse,
+    GstBaseParseFrame * frame);
 
 GST_BOILERPLATE (GstFlacParse, gst_flac_parse, GstBaseParse,
     GST_TYPE_BASE_PARSE);
@@ -224,37 +228,73 @@ gst_flac_parse_class_init (GstFlacParseClass * klass)
   GstBaseParseClass *baseparse_class = GST_BASE_PARSE_CLASS (klass);
 
   gobject_class->finalize = gst_flac_parse_finalize;
+  gobject_class->set_property = gst_flac_parse_set_property;
+  gobject_class->get_property = gst_flac_parse_get_property;
+
+  g_object_class_install_property (gobject_class, PROP_CHECK_FRAME_CHECKSUMS,
+      g_param_spec_boolean ("check-frame-checksums", "Check Frame Checksums",
+          "Check the overall checksums of every frame",
+          DEFAULT_CHECK_FRAME_CHECKSUMS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   baseparse_class->start = GST_DEBUG_FUNCPTR (gst_flac_parse_start);
   baseparse_class->stop = GST_DEBUG_FUNCPTR (gst_flac_parse_stop);
   baseparse_class->check_valid_frame =
       GST_DEBUG_FUNCPTR (gst_flac_parse_check_valid_frame);
   baseparse_class->parse_frame = GST_DEBUG_FUNCPTR (gst_flac_parse_parse_frame);
-  baseparse_class->get_frame_overhead =
-      GST_DEBUG_FUNCPTR (gst_flac_parse_get_frame_overhead);
+  baseparse_class->pre_push_frame =
+      GST_DEBUG_FUNCPTR (gst_flac_parse_pre_push_frame);
 }
 
 static void
 gst_flac_parse_init (GstFlacParse * flacparse, GstFlacParseClass * klass)
 {
+  flacparse->check_frame_checksums = DEFAULT_CHECK_FRAME_CHECKSUMS;
+}
+
+static void
+gst_flac_parse_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstFlacParse *flacparse = GST_FLAC_PARSE (object);
+
+  switch (prop_id) {
+    case PROP_CHECK_FRAME_CHECKSUMS:
+      flacparse->check_frame_checksums = g_value_get_boolean (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+gst_flac_parse_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstFlacParse *flacparse = GST_FLAC_PARSE (object);
+
+  switch (prop_id) {
+    case PROP_CHECK_FRAME_CHECKSUMS:
+      g_value_set_boolean (value, flacparse->check_frame_checksums);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
 }
 
 static void
 gst_flac_parse_finalize (GObject * object)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (object);
-  GList *l;
 
   if (flacparse->tags) {
     gst_tag_list_free (flacparse->tags);
     flacparse->tags = NULL;
   }
 
-  for (l = flacparse->headers; l; l = l->next) {
-    if (l->data)
-      gst_mini_object_unref (l->data);
-  }
-
+  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;
 
@@ -287,6 +327,10 @@ gst_flac_parse_start (GstBaseParse * parse)
   /* "fLaC" marker */
   gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), 4);
 
+  /* inform baseclass we can come up with ts, based on counters in packets */
+  gst_base_parse_set_has_timing_info (GST_BASE_PARSE_CAST (flacparse), TRUE);
+  gst_base_parse_set_syncable (GST_BASE_PARSE_CAST (flacparse), TRUE);
+
   return TRUE;
 }
 
@@ -294,178 +338,322 @@ static gboolean
 gst_flac_parse_stop (GstBaseParse * parse)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
-  GList *l;
 
   if (flacparse->tags) {
     gst_tag_list_free (flacparse->tags);
     flacparse->tags = NULL;
   }
 
-  for (l = flacparse->headers; l; l = l->next) {
-    if (l->data)
-      gst_mini_object_unref (l->data);
-  }
-
+  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;
 
   return TRUE;
 }
 
-static int64_t get_utf8(GetBitContext *s)
+static const guint8 sample_size_table[] = { 0, 8, 12, 0, 16, 20, 24, 0 };
+
+static const guint16 blocksize_table[16] = {
+  0, 192, 576 << 0, 576 << 1, 576 << 2, 576 << 3, 0, 0,
+  256 << 0, 256 << 1, 256 << 2, 256 << 3, 256 << 4, 256 << 5, 256 << 6,
+  256 << 7,
+};
+
+static const guint32 sample_rate_table[16] = {
+  0,
+  88200, 176400, 192000,
+  8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000,
+  0, 0, 0, 0,
+};
+
+typedef enum
 {
-	int64_t val;
-	int ones;
+  FRAME_HEADER_VALID,
+  FRAME_HEADER_INVALID,
+  FRAME_HEADER_MORE_DATA
+} FrameHeaderCheckReturn;
 
-	for (ones = 0; get_bits1(s); ones++);
-	if (ones == 1 || ones >= 8)
-		return -1;
-
-	val = get_bits(s, 7 - ones);
-
-	while (--ones > 0) {
-		int tmp = get_bits(s, 8) - 128;
-		if (tmp >> 6)
-			return -1;
-		val = (val << 6) + tmp;
-	}
-	return val;
-}
-
-static bool frame_header_is_valid(GstFlacParse *flacparse, const uint8_t *buf)
+static FrameHeaderCheckReturn
+gst_flac_parse_frame_header_is_valid (GstFlacParse * flacparse,
+    const guint8 * data, guint size, gboolean set, guint16 * block_size_ret)
 {
-	GetBitContext s;
-	int bs_code, sr_code, bps_code;
-	int channels, ch_mode;
-	int bps;
-	int is_var_size;
-	int blocksize, samplerate;
-	int64_t sample_num;
-	guint8 actual_crc, expected_crc;
+  GstBitReader reader = GST_BIT_READER_INIT (data, size);
+  guint8 blocking_strategy;
+  guint16 block_size;
+  guint32 samplerate = 0;
+  guint64 sample_number;
+  guint8 channels, bps;
+  guint8 tmp = 0;
+  guint8 actual_crc, expected_crc = 0;
 
-	init_get_bits(&s, buf, FLAC_MAX_FRAME_HEADER_SIZE * 8);
+  /* Skip 14 bit sync code */
+  gst_bit_reader_skip_unchecked (&reader, 14);
 
-	/* frame sync code */
-	if ((get_bits(&s, 15) & 0x7fff) != 0x7ffc)
-		return false;
+  /* Must be 0 */
+  if (gst_bit_reader_get_bits_uint8_unchecked (&reader, 1) != 0)
+    goto error;
 
-	/* uses fixed size stream code */
-	is_var_size = get_bits1(&s);
+  /* 0 == fixed block size, 1 == variable block size */
+  blocking_strategy = gst_bit_reader_get_bits_uint8_unchecked (&reader, 1);
 
-	/* block size and sample rate codes */
-	bs_code = get_bits(&s, 4);
-	sr_code = get_bits(&s, 4);
+  /* block size index, calculation of the real blocksize below */
+  block_size = gst_bit_reader_get_bits_uint16_unchecked (&reader, 4);
+  if (block_size == 0)
+    goto error;
 
-	/* channels and decorrelation */
-	ch_mode = get_bits(&s, 4);
-	if (ch_mode < FLAC_MAX_CHANNELS) {
-		channels = ch_mode + 1;
-	} else if (ch_mode <= FLAC_CHMODE_MID_SIDE) {
-		channels = 2;
-	} else {
-		return false;
-	}
+  /* sample rate index, calculation of the real samplerate below */
+  samplerate = gst_bit_reader_get_bits_uint16_unchecked (&reader, 4);
+  if (samplerate == 0x0f)
+    goto error;
 
-	/* bits per sample */
-	bps_code = get_bits(&s, 3);
-	if (bps_code == 3 || bps_code == 7)
-		return false;
-	bps = sample_size_table[bps_code];
+  /* channel assignment */
+  channels = gst_bit_reader_get_bits_uint8_unchecked (&reader, 4);
+  if (channels < 8) {
+    channels++;
+  } else if (channels <= 10) {
+    channels = 2;
+  } else if (channels > 10) {
+    goto error;
+  }
+  if (flacparse->channels && flacparse->channels != channels)
+    goto error;
 
-	/* reserved bit */
-	if (get_bits1(&s))
-		return false;
+  /* bits per sample */
+  bps = gst_bit_reader_get_bits_uint8_unchecked (&reader, 3);
+  if (bps == 0x03 || bps == 0x07) {
+    goto error;
+  } else if (bps == 0 && flacparse->bps == 0) {
+    goto need_streaminfo;
+  }
+  bps = sample_size_table[bps];
+  if (flacparse->bps && bps != flacparse->bps)
+    goto error;
 
-	/* sample or frame count */
-	sample_num = get_utf8(&s);
-	if (sample_num < 0)
-		return false;
+  /* reserved, must be 0 */
+  if (gst_bit_reader_get_bits_uint8_unchecked (&reader, 1) != 0)
+    goto error;
 
-	/* blocksize */
-	if (bs_code == 0) {
-		return false;
-	} else if (bs_code == 6) {
-		blocksize = get_bits(&s, 8) + 1;
-	} else if (bs_code == 7) {
-		blocksize = get_bits(&s, 16) + 1;
-	} else {
-		blocksize = blocksize_table[bs_code];
-	}
+  /* read "utf8" encoded sample/frame number */
+  {
+    gint len = 0;
 
-	/* sample rate */
-	if (sr_code < 12) {
-		samplerate = sample_rate_table[sr_code];
-	} else if (sr_code == 12) {
-		samplerate = get_bits(&s, 8) * 1000;
-	} else if (sr_code == 13) {
-		samplerate = get_bits(&s, 16);
-	} else if (sr_code == 14) {
-		samplerate = get_bits(&s, 16) * 10;
-	} else {
-		return false;
-	}
+    len = gst_bit_reader_get_bits_uint8_unchecked (&reader, 8);
 
-	/* header CRC-8 check */
-	expected_crc = get_bits(&s, 8);
-	actual_crc = gst_flac_calculate_crc8(buf, get_bits_count(&s) / 8 - 1);
-	if (actual_crc != expected_crc)
-		return false;
+    /* This is slightly faster than a loop */
+    if (!(len & 0x80)) {
+      sample_number = len;
+      len = 0;
+    } else if ((len & 0xc0) && !(len & 0x20)) {
+      sample_number = len & 0x1f;
+      len = 1;
+    } else if ((len & 0xe0) && !(len & 0x10)) {
+      sample_number = len & 0x0f;
+      len = 2;
+    } else if ((len & 0xf0) && !(len & 0x08)) {
+      sample_number = len & 0x07;
+      len = 3;
+    } else if ((len & 0xf8) && !(len & 0x04)) {
+      sample_number = len & 0x03;
+      len = 4;
+    } else if ((len & 0xfc) && !(len & 0x02)) {
+      sample_number = len & 0x01;
+      len = 5;
+    } else if ((len & 0xfe) && !(len & 0x01)) {
+      sample_number = len & 0x0;
+      len = 6;
+    } else {
+      goto error;
+    }
 
-	flacparse->block_size = blocksize;
-	if (!flacparse->samplerate)
-		flacparse->samplerate = samplerate;
-	if (!flacparse->bps)
-		flacparse->bps = bps;
-	if (!flacparse->blocking_strategy)
-		flacparse->blocking_strategy = is_var_size;
-	if (!flacparse->channels)
-		flacparse->channels = channels;
-	if (!flacparse->sample_number)
-		flacparse->sample_number = sample_num;
+    if ((blocking_strategy == 0 && len > 5) ||
+        (blocking_strategy == 1 && len > 6))
+      goto error;
 
-	return true;
-}
+    while (len > 0) {
+      if (!gst_bit_reader_get_bits_uint8 (&reader, &tmp, 8))
+        goto need_more_data;
 
-static bool
-get_next_sync(GstFlacParse *flacparse, const uint8_t *buffer, size_t size, unsigned *ret)
-{
-	unsigned max;
-	unsigned i, search_start, search_end;
+      if ((tmp & 0xc0) != 0x80)
+        goto error;
 
-	if (size <= flacparse->min_framesize)
-		goto need_more;
+      sample_number <<= 6;
+      sample_number |= (tmp & 0x3f);
+      len--;
+    }
+  }
 
-	if (!frame_header_is_valid(flacparse, buffer)) {
-		*ret = 0;
-		return false;
-	}
+  /* calculate real blocksize from the blocksize index */
+  if (block_size == 0) {
+    goto error;
+  } else if (block_size == 6) {
+    if (!gst_bit_reader_get_bits_uint16 (&reader, &block_size, 8))
+      goto need_more_data;
+    block_size++;
+  } else if (block_size == 7) {
+    if (!gst_bit_reader_get_bits_uint16 (&reader, &block_size, 16))
+      goto need_more_data;
+    block_size++;
+  } else {
+    block_size = blocksize_table[block_size];
+  }
 
-	search_start = MAX(2, flacparse->min_framesize);
-	search_end = MIN(size, flacparse->max_framesize);
-	search_end -= (FLAC_MAX_FRAME_HEADER_SIZE - 1);
+  /* calculate the real samplerate from the samplerate index */
+  if (samplerate == 0 && flacparse->samplerate == 0) {
+    goto need_streaminfo;
+  } else if (samplerate < 12) {
+    samplerate = sample_rate_table[samplerate];
+  } else if (samplerate == 12) {
+    if (!gst_bit_reader_get_bits_uint32 (&reader, &samplerate, 8))
+      goto need_more_data;
+    samplerate *= 1000;
+  } else if (samplerate == 13) {
+    if (!gst_bit_reader_get_bits_uint32 (&reader, &samplerate, 16))
+      goto need_more_data;
+  } else if (samplerate == 14) {
+    if (!gst_bit_reader_get_bits_uint32 (&reader, &samplerate, 16))
+      goto need_more_data;
+    samplerate *= 10;
+  }
 
-	for (i = search_start; i < search_end; i++) {
-		if ((AV_RB16(buffer + i) & 0xfffe) == 0xfff8 &&
-				frame_header_is_valid(flacparse, buffer + i))
-		{
-			*ret = i;
-			return true;
-		}
-	}
+  if (flacparse->samplerate && flacparse->samplerate != samplerate)
+    goto error;
 
-need_more:
-	max = flacparse->max_framesize;
-	if (!max)
-		max = 1 << 24;
-	*ret = MIN(size + 4096, max);
-	return false;
+  /* check crc-8 for the header */
+  if (!gst_bit_reader_get_bits_uint8 (&reader, &expected_crc, 8))
+    goto need_more_data;
+
+  actual_crc =
+      gst_flac_calculate_crc8 (data,
+      (gst_bit_reader_get_pos (&reader) / 8) - 1);
+  if (actual_crc != expected_crc)
+    goto error;
+
+  if (set) {
+    flacparse->block_size = block_size;
+    if (!flacparse->samplerate)
+      flacparse->samplerate = samplerate;
+    if (!flacparse->bps)
+      flacparse->bps = bps;
+    if (!flacparse->blocking_strategy)
+      flacparse->blocking_strategy = blocking_strategy;
+    if (!flacparse->channels)
+      flacparse->channels = channels;
+    if (!flacparse->sample_number)
+      flacparse->sample_number = sample_number;
+
+    GST_DEBUG_OBJECT (flacparse,
+        "Parsed frame at offset %" G_GUINT64_FORMAT ":\n" "Block size: %u\n"
+        "Sample/Frame number: %" G_GUINT64_FORMAT, flacparse->offset,
+        flacparse->block_size, flacparse->sample_number);
+  }
+
+  if (block_size_ret)
+    *block_size_ret = block_size;
+
+  return FRAME_HEADER_VALID;
+
+need_streaminfo:
+  GST_ERROR_OBJECT (flacparse, "Need STREAMINFO");
+  return FRAME_HEADER_INVALID;
+error:
+  return FRAME_HEADER_INVALID;
+
+need_more_data:
+  return FRAME_HEADER_MORE_DATA;
 }
 
 static gboolean
-gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
-    guint * framesize, gint * skipsize)
+gst_flac_parse_frame_is_valid (GstFlacParse * flacparse,
+    GstBaseParseFrame * frame, guint * ret)
+{
+  GstBuffer *buffer;
+  const guint8 *data;
+  guint max, size, remaining;
+  guint i, search_start, search_end;
+  FrameHeaderCheckReturn header_ret;
+  guint16 block_size;
+
+  buffer = frame->buffer;
+  data = GST_BUFFER_DATA (buffer);
+  size = GST_BUFFER_SIZE (buffer);
+
+  if (size <= flacparse->min_framesize)
+    goto need_more;
+
+  header_ret =
+      gst_flac_parse_frame_header_is_valid (flacparse, data, size, TRUE,
+      &block_size);
+  if (header_ret == FRAME_HEADER_INVALID) {
+    *ret = 0;
+    return FALSE;
+  } else if (header_ret == FRAME_HEADER_MORE_DATA) {
+    goto need_more;
+  }
+
+  /* mind unknown framesize */
+  search_start = MAX (2, flacparse->min_framesize);
+  if (flacparse->max_framesize)
+    search_end = MIN (size, flacparse->max_framesize + 9 + 2);
+  else
+    search_end = size;
+  search_end -= 2;
+
+  remaining = size;
+
+  for (i = search_start; i < search_end; i++, remaining--) {
+    if ((GST_READ_UINT16_BE (data + i) & 0xfffe) == 0xfff8) {
+      header_ret =
+          gst_flac_parse_frame_header_is_valid (flacparse, data + i, remaining,
+          FALSE, NULL);
+      if (header_ret == FRAME_HEADER_VALID) {
+        if (flacparse->check_frame_checksums) {
+          guint16 actual_crc = gst_flac_calculate_crc16 (data, i - 2);
+          guint16 expected_crc = GST_READ_UINT16_BE (data + i - 2);
+
+          if (actual_crc != expected_crc)
+            continue;
+        }
+        *ret = i;
+        flacparse->block_size = block_size;
+        return TRUE;
+      } else if (header_ret == FRAME_HEADER_MORE_DATA) {
+        goto need_more;
+      }
+    }
+  }
+
+  /* For the last frame output everything to the end */
+  if (G_UNLIKELY (GST_BASE_PARSE_DRAINING (flacparse))) {
+    if (flacparse->check_frame_checksums) {
+      guint16 actual_crc = gst_flac_calculate_crc16 (data, size - 2);
+      guint16 expected_crc = GST_READ_UINT16_BE (data + size - 2);
+
+      if (actual_crc == expected_crc) {
+        *ret = size;
+        flacparse->block_size = block_size;
+        return TRUE;
+      }
+    } else {
+      *ret = size;
+      flacparse->block_size = block_size;
+      return TRUE;
+    }
+  }
+
+need_more:
+  max = flacparse->max_framesize + 16;
+  if (max == 16)
+    max = 1 << 24;
+  *ret = MIN (size + 4096, max);
+  return FALSE;
+}
+
+static gboolean
+gst_flac_parse_check_valid_frame (GstBaseParse * parse,
+    GstBaseParseFrame * frame, guint * framesize, gint * skipsize)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
+  GstBuffer *buffer = frame->buffer;
   const guint8 *data = GST_BUFFER_DATA (buffer);
 
   if (G_UNLIKELY (GST_BUFFER_SIZE (buffer) < 4))
@@ -479,7 +667,7 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
     } else if (data[0] == 0xff && (data[1] >> 2) == 0x3e) {
       GST_DEBUG_OBJECT (flacparse, "Found headerless FLAC");
       /* Minimal size of a frame header */
-      gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), 16);
+      gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), 9);
       flacparse->state = GST_FLAC_PARSE_STATE_GENERATE_HEADERS;
       *skipsize = 0;
       return FALSE;
@@ -494,35 +682,37 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
     *framesize = size;
     return TRUE;
   } else {
-    if ((AV_RB16(data) & 0xfffe) == 0xfff8) {
-      unsigned next;
+    if ((GST_READ_UINT16_BE (data) & 0xfffe) == 0xfff8) {
+      gboolean ret;
+      guint next;
 
-      flacparse->offset = buffer->offset;
+      flacparse->offset = GST_BUFFER_OFFSET (buffer);
       flacparse->blocking_strategy = 0;
       flacparse->block_size = 0;
       flacparse->sample_number = 0;
 
       GST_DEBUG_OBJECT (flacparse, "Found sync code");
-      if (get_next_sync (flacparse, buffer->data, buffer->size, &next)) {
-        GST_DEBUG_OBJECT (flacparse, "Found next sync code");
+      ret = gst_flac_parse_frame_is_valid (flacparse, frame, &next);
+      if (ret) {
         *framesize = next;
         return TRUE;
       } else {
-        /* not enough, if that was all available, give up on frame */
-        if (G_UNLIKELY (gst_base_parse_get_drain (parse))) {
+        /* If we're at EOS and the frame was not valid, drop it! */
+        if (G_UNLIKELY (GST_BASE_PARSE_DRAINING (flacparse))) {
           GST_WARNING_OBJECT (flacparse, "EOS");
           return FALSE;
         }
 
-        if (next == 0)
-          ;
-        else if (next > buffer->size) {
+        if (next == 0) {
+        } else if (next > GST_BUFFER_SIZE (buffer)) {
           GST_DEBUG_OBJECT (flacparse, "Requesting %u bytes", next);
           *skipsize = 0;
           gst_base_parse_set_min_frame_size (parse, next);
           return FALSE;
         } else {
-          GST_DEBUG_OBJECT (flacparse, "Giving up on invalid frame (%d bytes)", buffer->size);
+          GST_ERROR_OBJECT (flacparse,
+              "Giving up on invalid frame (%d bytes)",
+              GST_BUFFER_SIZE (buffer));
           return FALSE;
         }
       }
@@ -530,7 +720,8 @@ gst_flac_parse_check_valid_frame (GstBaseParse * parse, GstBuffer * buffer,
       GstByteReader reader = GST_BYTE_READER_INIT_FROM_BUFFER (buffer);
       gint off;
 
-      off = gst_byte_reader_masked_scan_uint32 (&reader, 0xfffc0000, 0xfff80000,
+      off =
+          gst_byte_reader_masked_scan_uint32 (&reader, 0xfffc0000, 0xfff80000,
           0, GST_BUFFER_SIZE (buffer));
 
       if (off > 0) {
@@ -608,7 +799,7 @@ gst_flac_parse_handle_streaminfo (GstFlacParse * flacparse, GstBuffer * buffer)
   if (flacparse->total_samples)
     gst_base_parse_set_duration (GST_BASE_PARSE (flacparse), GST_FORMAT_TIME,
         GST_FRAMES_TO_CLOCK_TIME (flacparse->total_samples,
-            flacparse->samplerate));
+            flacparse->samplerate), 0);
 
   GST_DEBUG_OBJECT (flacparse, "STREAMINFO:\n"
       "\tmin/max blocksize: %u/%u,\n"
@@ -642,9 +833,6 @@ gst_flac_parse_handle_vorbiscomment (GstFlacParse * flacparse,
     gst_tag_list_free (flacparse->tags);
     flacparse->tags = NULL;
   }
-
-  if (flacparse->tags)
-	  GST_BASE_PARSE (flacparse)->tags = gst_tag_list_copy(flacparse->tags);
 
   return TRUE;
 }
@@ -697,10 +885,64 @@ error:
   return FALSE;
 }
 
+static gboolean
+gst_flac_parse_handle_seektable (GstFlacParse * flacparse, GstBuffer * buffer)
+{
+
+  GST_DEBUG_OBJECT (flacparse, "storing seektable");
+  /* only store for now;
+   * offset of the first frame is needed to get real info */
+  flacparse->seektable = gst_buffer_ref (buffer);
+
+  return TRUE;
+}
+
+static void
+gst_flac_parse_process_seektable (GstFlacParse * flacparse, gint64 boffset)
+{
+  GstByteReader br;
+  gint64 offset = 0, samples = 0;
+
+  GST_DEBUG_OBJECT (flacparse,
+      "parsing seektable; base offset %" G_GINT64_FORMAT, boffset);
+
+  if (boffset <= 0)
+    goto done;
+
+  gst_byte_reader_init_from_buffer (&br, flacparse->seektable);
+  /* skip header */
+  if (!gst_byte_reader_skip (&br, 4))
+    goto done;
+
+  /* seekpoints */
+  while (gst_byte_reader_get_remaining (&br)) {
+    if (!gst_byte_reader_get_int64_be (&br, &samples))
+      break;
+    if (!gst_byte_reader_get_int64_be (&br, &offset))
+      break;
+    if (!gst_byte_reader_skip (&br, 2))
+      break;
+
+    GST_LOG_OBJECT (flacparse, "samples %" G_GINT64_FORMAT " -> offset %"
+        G_GINT64_FORMAT, samples, offset);
+
+    /* sanity check */
+    if (G_LIKELY (offset > 0 && samples > 0)) {
+      gst_base_parse_add_index_entry (GST_BASE_PARSE (flacparse),
+          boffset + offset, gst_util_uint64_scale (samples, GST_SECOND,
+              flacparse->samplerate), TRUE, FALSE);
+    }
+  }
+
+done:
+  gst_buffer_unref (flacparse->seektable);
+  flacparse->seektable = NULL;
+}
+
 static void
 _value_array_append_buffer (GValue * array_val, GstBuffer * buf)
 {
-  GValue value = { .g_type = 0 };
+  GValue value = { 0, };
 
   g_value_init (&value, GST_TYPE_BUFFER);
   /* copy buffer to avoid problems with circular refcounts */
@@ -719,9 +961,10 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
   GstBuffer *vorbiscomment = NULL;
   GstBuffer *streaminfo = NULL;
   GstBuffer *marker = NULL;
-  GValue array = { .g_type = 0 };
+  GValue array = { 0, };
   GstCaps *caps;
   GList *l;
+  gboolean res = TRUE;
 
   caps = gst_caps_new_simple ("audio/x-flac",
       "channels", G_TYPE_INT, flacparse->channels,
@@ -801,19 +1044,11 @@ push_headers:
 
   /* push header buffers; update caps, so when we push the first buffer the
    * negotiated caps will change to caps that include the streamheader field */
-  for (l = flacparse->headers; l; l = l->next) {
-    if (l->data)
-      gst_mini_object_unref (l->data);
-  }
+  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
   g_list_free (flacparse->headers);
   flacparse->headers = NULL;
 
-  /* Push tags */
-  if (flacparse->tags)
-    gst_element_found_tags (GST_ELEMENT (flacparse),
-        gst_tag_list_copy (flacparse->tags));
-
-  return TRUE;
+  return res;
 }
 
 static gboolean
@@ -895,13 +1130,13 @@ gst_flac_parse_generate_headers (GstFlacParse * flacparse)
     header[0] = 0x84;           /* is_last = 1; type = 4; */
 
     vorbiscomment =
-        gst_tag_list_to_vorbiscomment_buffer (taglist, header, sizeof (header),
-        NULL);
+        gst_tag_list_to_vorbiscomment_buffer (taglist, header,
+        sizeof (header), NULL);
     gst_tag_list_free (taglist);
 
     /* Get rid of framing bit */
-    if (GST_BUFFER_DATA (vorbiscomment)[GST_BUFFER_SIZE (vorbiscomment) - 1] ==
-        1) {
+    if (GST_BUFFER_DATA (vorbiscomment)[GST_BUFFER_SIZE (vorbiscomment) -
+            1] == 1) {
       GstBuffer *sub;
 
       sub =
@@ -927,9 +1162,10 @@ gst_flac_parse_generate_headers (GstFlacParse * flacparse)
 }
 
 static GstFlowReturn
-gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
+gst_flac_parse_parse_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
+  GstBuffer *buffer = frame->buffer;
   const guint8 *data = GST_BUFFER_DATA (buffer);
 
   if (flacparse->state == GST_FLAC_PARSE_STATE_INIT) {
@@ -963,7 +1199,8 @@ gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
           return GST_FLOW_ERROR;
         break;
       case 3:                  /* SEEKTABLE */
-        /* TODO: handle seektables */
+        if (!gst_flac_parse_handle_seektable (flacparse, buffer))
+          return GST_FLOW_ERROR;
         break;
       case 4:                  /* VORBIS_COMMENT */
         if (!gst_flac_parse_handle_vorbiscomment (flacparse, buffer))
@@ -985,29 +1222,30 @@ gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
     GST_BUFFER_OFFSET (buffer) = 0;
     GST_BUFFER_OFFSET_END (buffer) = 0;
 
-    if (is_last) {
-      flacparse->headers =
-          g_list_append (flacparse->headers, gst_buffer_ref (buffer));
+    flacparse->headers =
+        g_list_append (flacparse->headers, gst_buffer_ref (buffer));
 
+    if (is_last) {
       if (!gst_flac_parse_handle_headers (flacparse))
         return GST_FLOW_ERROR;
 
       /* Minimal size of a frame header */
-      gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), MAX (16,
+      gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), MAX (9,
               flacparse->min_framesize));
       flacparse->state = GST_FLAC_PARSE_STATE_DATA;
-
-      /* DROPPED because we pushed all headers manually already */
-      return GST_BASE_PARSE_FLOW_DROPPED;
-    } else {
-      flacparse->headers =
-          g_list_append (flacparse->headers, gst_buffer_ref (buffer));
-      return GST_BASE_PARSE_FLOW_DROPPED;
     }
+
+    /* DROPPED because we pushed already or will push all headers manually */
+    return GST_BASE_PARSE_FLOW_DROPPED;
   } else {
     if (flacparse->offset != GST_BUFFER_OFFSET (buffer)) {
+      FrameHeaderCheckReturn ret;
+
       flacparse->offset = GST_BUFFER_OFFSET (buffer);
-      if (!frame_header_is_valid(flacparse, buffer->data)) {
+      ret =
+          gst_flac_parse_frame_header_is_valid (flacparse,
+          GST_BUFFER_DATA (buffer), GST_BUFFER_SIZE (buffer), TRUE, NULL);
+      if (ret != FRAME_HEADER_VALID) {
         GST_ERROR_OBJECT (flacparse,
             "Baseclass didn't provide a complete frame");
         return GST_FLOW_ERROR;
@@ -1018,6 +1256,9 @@ gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
       GST_ERROR_OBJECT (flacparse, "Unparsed frame");
       return GST_FLOW_ERROR;
     }
+
+    if (flacparse->seektable)
+      gst_flac_parse_process_seektable (flacparse, GST_BUFFER_OFFSET (buffer));
 
     if (flacparse->state == GST_FLAC_PARSE_STATE_GENERATE_HEADERS) {
       if (flacparse->blocking_strategy == 1) {
@@ -1053,13 +1294,19 @@ gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
       GST_BUFFER_OFFSET_END (buffer) =
           flacparse->sample_number + flacparse->block_size;
     }
-    GST_BUFFER_DURATION (buffer) =
-        GST_FRAMES_TO_CLOCK_TIME (flacparse->block_size, flacparse->samplerate);
     GST_BUFFER_OFFSET (buffer) =
-        GST_BUFFER_TIMESTAMP (buffer) + GST_BUFFER_DURATION (buffer);
+        gst_util_uint64_scale (GST_BUFFER_OFFSET_END (buffer), GST_SECOND,
+        flacparse->samplerate);
+    GST_BUFFER_DURATION (buffer) =
+        GST_BUFFER_OFFSET (buffer) - GST_BUFFER_TIMESTAMP (buffer);
+
+    /* To simplify, we just assume that it's a fixed size header and ignore
+     * subframe headers. The first could lead us to being off by 88 bits and
+     * the second even less, so the total inaccuracy is negligible. */
+    frame->overhead = 7;
 
     /* Minimal size of a frame header */
-    gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), MAX (16,
+    gst_base_parse_set_min_frame_size (GST_BASE_PARSE (flacparse), MAX (9,
             flacparse->min_framesize));
 
     flacparse->offset = -1;
@@ -1070,16 +1317,18 @@ gst_flac_parse_parse_frame (GstBaseParse * parse, GstBuffer * buffer)
   }
 }
 
-static gint
-gst_flac_parse_get_frame_overhead (GstBaseParse * parse, GstBuffer * buffer)
+static GstFlowReturn
+gst_flac_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 {
   GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
 
-  if (flacparse->state != GST_FLAC_PARSE_STATE_DATA)
-    return -1;
-  else
-    /* To simplify, we just assume that it's a fixed size header and ignore
-     * subframe headers. The first could lead us to being off by 88 bits and
-     * the second even less, so the total inaccuracy is negligible. */
-    return 7;
+  /* Push tags */
+  if (flacparse->tags) {
+    gst_element_found_tags (GST_ELEMENT (flacparse), flacparse->tags);
+    flacparse->tags = NULL;
+  }
+
+  frame->flags |= GST_BASE_PARSE_FRAME_FLAG_CLIP;
+
+  return GST_FLOW_OK;
 }

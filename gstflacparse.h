@@ -54,6 +54,9 @@ typedef struct {
 struct _GstFlacParse {
   GstBaseParse parent;
 
+  /* Properties */
+  gboolean check_frame_checksums;
+
   GstFlacParseState state;
 
   gint64 upstream_length;
@@ -75,6 +78,7 @@ struct _GstFlacParse {
   GstTagList *tags;
 
   GList *headers;
+  GstBuffer *seektable;
 };
 
 struct _GstFlacParseClass {

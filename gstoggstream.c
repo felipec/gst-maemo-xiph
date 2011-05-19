@@ -1759,6 +1759,7 @@ packet_duration_kate (GstOggStream * pad, ogg_packet * packet)
   return duration;
 }
 
+#if !GST_CHECK_VERSION(0,10,25)
 static void
 extract_tags_kate (GstOggStream * pad, ogg_packet * packet)
 {
@@ -1809,6 +1810,7 @@ extract_tags_kate (GstOggStream * pad, ogg_packet * packet)
       pad->taglist = list;
   }
 }
+#endif
 
 
 /* *INDENT-OFF* */
@@ -1955,7 +1957,9 @@ const GstOggMap mappers[] = {
     is_header_count,
     packet_duration_kate,
     NULL,
+#if !GST_CHECK_VERSION(0,10,25)
     extract_tags_kate
+#endif
   },
   {
     "BBCD\0", 5, 13,

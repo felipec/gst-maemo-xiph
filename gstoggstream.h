@@ -25,6 +25,7 @@
 #include <ogg/ogg.h>
 
 #include <gst/gst.h>
+#include <gst/tag/tag.h>
 
 G_BEGIN_DECLS
 
@@ -52,6 +53,7 @@ struct _GstOggStream
   /* for oggparse */
   gboolean in_headers;
   GList *unknown_pages;
+  GList *stored_buffers;
 
   gint map;
   gboolean is_skeleton;
@@ -66,9 +68,11 @@ struct _GstOggStream
   gint frame_size;
   gint bitrate;
   guint64 total_time;
+  gboolean is_sparse;
 
   GstCaps *caps;
 
+  gboolean is_video;
   /* vorbis stuff */
   int nln_increments[4];
   int nsn_increment;
@@ -77,6 +81,11 @@ struct _GstOggStream
   int vorbis_log2_num_modes;
   int vorbis_mode_sizes[256];
   int last_size;
+  int version;
+  gint bitrate_upper;
+  gint bitrate_nominal;
+  gint bitrate_lower;
+  GstTagList *taglist;
   /* theora stuff */
   gboolean theora_has_zero_keyoffset;
   /* VP8 stuff */
@@ -97,6 +106,8 @@ struct _GstOggStream
 
 
 gboolean gst_ogg_stream_setup_map (GstOggStream * pad, ogg_packet *packet);
+gboolean gst_ogg_stream_setup_map_from_caps_headers (GstOggStream * pad,
+    const GstCaps * caps);
 GstClockTime gst_ogg_stream_get_end_time_for_granulepos (GstOggStream *pad,
     gint64 granulepos);
 GstClockTime gst_ogg_stream_get_start_time_for_granulepos (GstOggStream *pad,
@@ -111,6 +122,7 @@ gboolean gst_ogg_stream_granulepos_is_key_frame (GstOggStream *pad,
     gint64 granulepos);
 gboolean gst_ogg_stream_packet_is_header (GstOggStream *pad, ogg_packet *packet);
 gint64 gst_ogg_stream_get_packet_duration (GstOggStream * pad, ogg_packet *packet);
+void gst_ogg_stream_extract_tags (GstOggStream * pad, ogg_packet * packet);
 
 gboolean gst_ogg_map_parse_fisbone (GstOggStream * pad, const guint8 * data, guint size,
     guint32 * serialno, GstOggSkeleton *type);

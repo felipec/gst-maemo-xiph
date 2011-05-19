@@ -103,7 +103,6 @@ struct _GstOggPad
   gint64 first_granule;         /* the granulepos of first page == first sample in next page */
   GstClockTime first_time;      /* the timestamp of the second page or granuletime of first page */
 
-  gboolean     is_sparse;       /* TRUE if this is a subtitle pad or some other sparse stream */
   GstClockTime last_stop;       /* last_stop when last push occured; used to detect when we
                                  * need to send a newsegment update event for sparse streams */
 
@@ -114,7 +113,6 @@ struct _GstOggPad
   gboolean is_eos;
 
   gboolean added;
-  GstTagList *taglist;
 };
 
 struct _GstOggPadClass

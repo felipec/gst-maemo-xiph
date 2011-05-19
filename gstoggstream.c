@@ -55,6 +55,8 @@ typedef gboolean (*GstOggMapIsHeaderPacketFunc) (GstOggStream * pad,
     ogg_packet * packet);
 typedef gint64 (*GstOggMapPacketDurationFunc) (GstOggStream * pad,
     ogg_packet * packet);
+typedef void (*GstOggMapExtractTagsFunc) (GstOggStream * pad,
+    ogg_packet * packet);
 
 typedef gint64 (*GstOggMapGranuleposToKeyGranuleFunc) (GstOggStream * pad,
     gint64 granulepos);
@@ -76,9 +78,10 @@ struct _GstOggMap
   GstOggMapIsHeaderPacketFunc is_header_func;
   GstOggMapPacketDurationFunc packet_duration_func;
   GstOggMapGranuleposToKeyGranuleFunc granulepos_to_key_granule_func;
+  GstOggMapExtractTagsFunc extract_tags_func;
 };
 
-static const GstOggMap mappers[];
+extern const GstOggMap mappers[];
 
 GstClockTime
 gst_ogg_stream_get_packet_start_time (GstOggStream * pad, ogg_packet * packet)
@@ -173,10 +176,8 @@ gst_ogg_stream_granule_to_granulepos (GstOggStream * pad, gint64 granule,
       keyframe_granule);
 }
 
-#if 0
 gboolean
-gst_ogg_stream_packet_granulepos_is_key_frame (GstOggStream * pad,
-    gint64 granulepos)
+gst_ogg_stream_granulepos_is_key_frame (GstOggStream * pad, gint64 granulepos)
 {
   if (granulepos == -1) {
     return FALSE;
@@ -189,7 +190,6 @@ gst_ogg_stream_packet_granulepos_is_key_frame (GstOggStream * pad,
 
   return mappers[pad->map].is_key_frame_func (pad, granulepos);
 }
-#endif
 
 gboolean
 gst_ogg_stream_packet_is_header (GstOggStream * pad, ogg_packet * packet)
@@ -211,6 +211,18 @@ gst_ogg_stream_get_packet_duration (GstOggStream * pad, ogg_packet * packet)
   }
 
   return mappers[pad->map].packet_duration_func (pad, packet);
+}
+
+
+void
+gst_ogg_stream_extract_tags (GstOggStream * pad, ogg_packet * packet)
+{
+  if (mappers[pad->map].extract_tags_func == NULL) {
+    GST_DEBUG ("No tag extraction");
+    return;
+  }
+
+  mappers[pad->map].extract_tags_func (pad, packet);
 }
 
 /* some generic functions */
@@ -243,6 +255,11 @@ granule_to_granulepos_default (GstOggStream * pad, gint64 granule,
   gint64 keyoffset;
 
   if (pad->granuleshift != 0) {
+    /* If we don't know where the previous keyframe is yet, assume it is
+       at 0 or 1, depending on bitstream version. If nothing else, this
+       avoids getting negative granpos back. */
+    if (keyframe_granule < 0)
+      keyframe_granule = pad->theora_has_zero_keyoffset ? 0 : 1;
     keyoffset = granule - keyframe_granule;
     return (keyframe_granule << pad->granuleshift) | keyoffset;
   } else {
@@ -280,6 +297,49 @@ packet_duration_constant (GstOggStream * pad, ogg_packet * packet)
   return pad->frame_size;
 }
 
+/* helper: extracts tags from vorbis comment ogg packet.
+ * Returns result in *tags after free'ing existing *tags (if any) */
+static gboolean
+tag_list_from_vorbiscomment_packet (ogg_packet * packet,
+    const guint8 * id_data, const guint id_data_length, GstTagList ** tags)
+{
+  GstBuffer *buf = NULL;
+  gchar *encoder = NULL;
+  GstTagList *list;
+  gboolean ret = TRUE;
+
+  g_return_val_if_fail (tags != NULL, FALSE);
+
+  buf = gst_buffer_new ();
+  GST_BUFFER_DATA (buf) = (guint8 *) packet->packet;
+  GST_BUFFER_SIZE (buf) = packet->bytes;
+
+  list = gst_tag_list_from_vorbiscomment_buffer (buf, id_data, id_data_length,
+      &encoder);
+
+  if (!list) {
+    GST_WARNING ("failed to decode vorbis comments");
+    ret = FALSE;
+    goto exit;
+  }
+
+  if (encoder) {
+    if (encoder[0])
+      gst_tag_list_add (list, GST_TAG_MERGE_REPLACE, GST_TAG_ENCODER, encoder,
+          NULL);
+    g_free (encoder);
+  }
+
+exit:
+  if (*tags)
+    gst_tag_list_free (*tags);
+  *tags = list;
+
+  gst_buffer_unref (buf);
+
+  return ret;
+}
+
 /* theora */
 
 static gboolean
@@ -287,9 +347,14 @@ setup_theora_mapper (GstOggStream * pad, ogg_packet * packet)
 {
   guint8 *data = packet->packet;
   guint w, h, par_d, par_n;
+  guint8 vmaj, vmin, vrev;
 
-  w = GST_READ_UINT24_BE (data + 14) & 0xFFFFF0;
-  h = GST_READ_UINT24_BE (data + 17) & 0xFFFFF0;
+  vmaj = data[7];
+  vmin = data[8];
+  vrev = data[9];
+
+  w = GST_READ_UINT24_BE (data + 14) & 0xFFFFFF;
+  h = GST_READ_UINT24_BE (data + 17) & 0xFFFFFF;
 
   pad->granulerate_n = GST_READ_UINT32_BE (data + 22);
   pad->granulerate_d = GST_READ_UINT32_BE (data + 26);
@@ -304,6 +369,7 @@ setup_theora_mapper (GstOggStream * pad, ogg_packet * packet)
   pad->granuleshift = ((GST_READ_UINT8 (data + 40) & 0x03) << 3) +
       (GST_READ_UINT8 (data + 41) >> 5);
 
+  pad->is_video = TRUE;
   pad->n_header_packets = 3;
   pad->frame_size = 1;
 
@@ -314,6 +380,12 @@ setup_theora_mapper (GstOggStream * pad, ogg_packet * packet)
     GST_WARNING ("frame rate %d/%d", pad->granulerate_n, pad->granulerate_d);
     return FALSE;
   }
+
+  /* The interpretation of the granule position has changed with 3.2.1.
+     The granule is now made from the number of frames encoded, rather than
+     the index of the frame being encoded - so there is a difference of 1. */
+  pad->theora_has_zero_keyoffset =
+      ((vmaj << 16) | (vmin << 8) | vrev) < 0x030201;
 
   pad->caps = gst_caps_new_simple ("video/x-theora", NULL);
 
@@ -342,9 +414,6 @@ granulepos_to_granule_theora (GstOggStream * pad, gint64 granulepos)
   if (pad->granuleshift != 0) {
     keyindex = granulepos >> pad->granuleshift;
     keyoffset = granulepos - (keyindex << pad->granuleshift);
-    if (keyoffset == 0) {
-      pad->theora_has_zero_keyoffset = TRUE;
-    }
     if (pad->theora_has_zero_keyoffset) {
       keyoffset++;
     }
@@ -362,7 +431,7 @@ is_keyframe_theora (GstOggStream * pad, gint64 granulepos)
   if (granulepos == (gint64) - 1)
     return FALSE;
 
-  frame_mask = (1 << (pad->granuleshift + 1)) - 1;
+  frame_mask = (1 << pad->granuleshift) - 1;
 
   return ((granulepos & frame_mask) == 0);
 }
@@ -371,6 +440,22 @@ static gboolean
 is_header_theora (GstOggStream * pad, ogg_packet * packet)
 {
   return (packet->bytes > 0 && (packet->packet[0] & 0x80) == 0x80);
+}
+
+static void
+extract_tags_theora (GstOggStream * pad, ogg_packet * packet)
+{
+  if (packet->bytes > 0 && packet->packet[0] == 0x81) {
+    tag_list_from_vorbiscomment_packet (packet,
+        (const guint8 *) "\201theora", 7, &pad->taglist);
+
+    if (!pad->taglist)
+      pad->taglist = gst_tag_list_new ();
+
+    if (pad->bitrate)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_BITRATE, (guint) pad->bitrate, NULL);
+  }
 }
 
 /* dirac */
@@ -388,6 +473,7 @@ setup_dirac_mapper (GstOggStream * pad, ogg_packet * packet)
     return FALSE;
   }
 
+  pad->is_video = TRUE;
   pad->granulerate_n = header.frame_rate_numerator * 2;
   pad->granulerate_d = header.frame_rate_denominator;
   pad->granuleshift = 22;
@@ -415,22 +501,16 @@ setup_dirac_mapper (GstOggStream * pad, ogg_packet * packet)
 static gboolean
 is_keyframe_dirac (GstOggStream * pad, gint64 granulepos)
 {
-  gint64 pt;
   int dist_h;
   int dist_l;
   int dist;
-  int delay;
-  gint64 dt;
 
   if (granulepos == -1)
     return -1;
 
-  pt = ((granulepos >> 22) + (granulepos & OGG_DIRAC_GRANULE_LOW_MASK)) >> 9;
   dist_h = (granulepos >> 22) & 0xff;
   dist_l = granulepos & 0xff;
   dist = (dist_h << 8) | dist_l;
-  delay = (granulepos >> 9) & 0x1fff;
-  dt = pt - delay;
 
   return (dist == 0);
 }
@@ -439,16 +519,10 @@ static gint64
 granulepos_to_granule_dirac (GstOggStream * pad, gint64 gp)
 {
   gint64 pt;
-  int dist_h;
-  int dist_l;
-  int dist;
   int delay;
   gint64 dt;
 
   pt = ((gp >> 22) + (gp & OGG_DIRAC_GRANULE_LOW_MASK)) >> 9;
-  dist_h = (gp >> 22) & 0xff;
-  dist_l = gp & 0xff;
-  dist = (dist_h << 8) | dist_l;
   delay = (gp >> 9) & 0x1fff;
   dt = pt - delay;
 
@@ -508,6 +582,7 @@ setup_vp8_mapper (GstOggStream * pad, ogg_packet * packet)
   fps_n = GST_READ_UINT32_BE (packet->packet + 18);
   fps_d = GST_READ_UINT32_BE (packet->packet + 22);
 
+  pad->is_video = TRUE;
   pad->is_vp8 = TRUE;
   pad->granulerate_n = fps_n;
   pad->granulerate_d = fps_d;
@@ -603,6 +678,15 @@ is_header_vp8 (GstOggStream * pad, ogg_packet * packet)
   return FALSE;
 }
 
+static void
+extract_tags_vp8 (GstOggStream * pad, ogg_packet * packet)
+{
+  if (packet->bytes >= 7 && memcmp (packet->packet, "OVP80\2 ", 7) == 0) {
+    tag_list_from_vorbiscomment_packet (packet,
+        (const guint8 *) "OVP80\2 ", 7, &pad->taglist);
+  }
+}
+
 /* vorbis */
 
 static gboolean
@@ -611,7 +695,9 @@ setup_vorbis_mapper (GstOggStream * pad, ogg_packet * packet)
   guint8 *data = packet->packet;
   guint chans;
 
-  data += 1 + 6 + 4;
+  data += 1 + 6;
+  pad->version = GST_READ_UINT32_LE (data);
+  data += 4;
   chans = GST_READ_UINT8 (data);
   data += 1;
   pad->granulerate_n = GST_READ_UINT32_LE (data);
@@ -620,8 +706,22 @@ setup_vorbis_mapper (GstOggStream * pad, ogg_packet * packet)
   pad->last_size = 0;
   GST_LOG ("sample rate: %d", pad->granulerate_n);
 
-  data += 8;
-  pad->bitrate = GST_READ_UINT32_LE (data);
+  data += 4;
+  pad->bitrate_upper = GST_READ_UINT32_LE (data);
+  data += 4;
+  pad->bitrate_nominal = GST_READ_UINT32_LE (data);
+  data += 4;
+  pad->bitrate_lower = GST_READ_UINT32_LE (data);
+
+  if (pad->bitrate_nominal > 0)
+    pad->bitrate = pad->bitrate_nominal;
+
+  if (pad->bitrate_upper > 0 && !pad->bitrate)
+    pad->bitrate = pad->bitrate_upper;
+
+  if (pad->bitrate_lower > 0 && !pad->bitrate)
+    pad->bitrate = pad->bitrate_lower;
+
   GST_LOG ("bit rate: %d", pad->bitrate);
 
   pad->n_header_packets = 3;
@@ -649,6 +749,40 @@ is_header_vorbis (GstOggStream * pad, ogg_packet * packet)
   }
 
   return TRUE;
+}
+
+static void
+extract_tags_vorbis (GstOggStream * pad, ogg_packet * packet)
+{
+  if (packet->bytes == 0 || (packet->packet[0] & 0x01) == 0)
+    return;
+
+  if (((guint8 *) (packet->packet))[0] == 0x03) {
+    tag_list_from_vorbiscomment_packet (packet,
+        (const guint8 *) "\003vorbis", 7, &pad->taglist);
+
+    if (!pad->taglist)
+      pad->taglist = gst_tag_list_new ();
+
+    gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+        GST_TAG_ENCODER_VERSION, pad->version, NULL);
+
+    if (pad->bitrate_nominal > 0)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_NOMINAL_BITRATE, (guint) pad->bitrate_nominal, NULL);
+
+    if (pad->bitrate_upper > 0)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_MAXIMUM_BITRATE, (guint) pad->bitrate_upper, NULL);
+
+    if (pad->bitrate_lower > 0)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_MINIMUM_BITRATE, (guint) pad->bitrate_lower, NULL);
+
+    if (pad->bitrate)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_BITRATE, (guint) pad->bitrate, NULL);
+  }
 }
 
 static gint64
@@ -709,6 +843,22 @@ setup_speex_mapper (GstOggStream * pad, ogg_packet * packet)
       pad->granulerate_n, "channels", G_TYPE_INT, chans, NULL);
 
   return TRUE;
+}
+
+static void
+extract_tags_count (GstOggStream * pad, ogg_packet * packet)
+{
+  /* packet 2 must be comment packet */
+  if (packet->bytes > 0 && pad->n_header_packets_seen == 1) {
+    tag_list_from_vorbiscomment_packet (packet, NULL, 0, &pad->taglist);
+
+    if (!pad->taglist)
+      pad->taglist = gst_tag_list_new ();
+
+    if (pad->bitrate)
+      gst_tag_list_add (pad->taglist, GST_TAG_MERGE_REPLACE,
+          GST_TAG_BITRATE, (guint) pad->bitrate, NULL);
+  }
 }
 
 
@@ -820,6 +970,15 @@ packet_duration_flac (GstOggStream * pad, ogg_packet * packet)
   return -1;
 }
 
+static void
+extract_tags_flac (GstOggStream * pad, ogg_packet * packet)
+{
+  if (packet->bytes > 4 && ((packet->packet[0] & 0x7F) == 0x4)) {
+    tag_list_from_vorbiscomment_packet (packet,
+        packet->packet, 4, &pad->taglist);
+  }
+}
+
 /* fishead */
 
 static gboolean
@@ -918,6 +1077,9 @@ setup_fishead_mapper (GstOggStream * pad, ogg_packet * packet)
       GST_TIME_ARGS (pad->prestime));
 
   pad->is_skeleton = TRUE;
+  pad->is_sparse = TRUE;
+
+  pad->caps = gst_caps_new_simple ("none/none", NULL);
 
   return TRUE;
 }
@@ -942,8 +1104,10 @@ gst_ogg_map_parse_fisbone (GstOggStream * pad, const guint8 * data, guint size,
     GST_INFO ("got index packet");
     stype = GST_OGG_SKELETON_INDEX;
     serial_offset = 6;
+  } else if (memcmp (data, "fishead\0", 8) == 0) {
+    return FALSE;
   } else {
-    GST_WARNING ("unknown skeleton packet %10.10s", data);
+    GST_WARNING ("unknown skeleton packet \"%10.10s\"", data);
     return FALSE;
   }
 
@@ -1205,6 +1369,15 @@ is_header_ogm (GstOggStream * pad, ogg_packet * packet)
   return FALSE;
 }
 
+static void
+extract_tags_ogm (GstOggStream * pad, ogg_packet * packet)
+{
+  if (!(packet->packet[0] & 1) && (packet->packet[0] & 3 && pad->is_ogm_text)) {
+    tag_list_from_vorbiscomment_packet (packet,
+        (const guint8 *) "\003vorbis", 7, &pad->taglist);
+  }
+}
+
 static gint64
 packet_duration_ogm (GstOggStream * pad, ogg_packet * packet)
 {
@@ -1273,6 +1446,7 @@ setup_ogmvideo_mapper (GstOggStream * pad, ogg_packet * packet)
   GST_DEBUG ("time unit %d", GST_READ_UINT32_LE (data + 16));
   GST_DEBUG ("samples per unit %d", GST_READ_UINT32_LE (data + 24));
 
+  pad->is_video = TRUE;
   pad->granulerate_n = 10000000;
   time_unit = GST_READ_UINT64_LE (data + 17);
   if (time_unit > G_MAXINT || time_unit < G_MININT) {
@@ -1336,6 +1510,7 @@ setup_ogmtext_mapper (GstOggStream * pad, ogg_packet * packet)
   pad->n_header_packets = 1;
   pad->is_ogm = TRUE;
   pad->is_ogm_text = TRUE;
+  pad->is_sparse = TRUE;
 
   return TRUE;
 }
@@ -1493,6 +1668,7 @@ setup_cmml_mapper (GstOggStream * pad, ogg_packet * packet)
   GST_DEBUG ("blocksize1: %u", 1 << (data[0] & 0x0F));
 
   pad->caps = gst_caps_new_simple ("text/x-cmml", NULL);
+  pad->is_sparse = TRUE;
 
   return TRUE;
 }
@@ -1538,6 +1714,7 @@ setup_kate_mapper (GstOggStream * pad, ogg_packet * packet)
   GST_LOG ("sample rate: %d", pad->granulerate_n);
 
   pad->n_header_packets = GST_READ_UINT8 (data + 11);
+  GST_LOG ("kate header packets: %d", pad->n_header_packets);
 
   if (pad->granulerate_n == 0)
     return FALSE;
@@ -1551,13 +1728,92 @@ setup_kate_mapper (GstOggStream * pad, ogg_packet * packet)
     pad->caps = gst_caps_new_simple ("application/x-kate", NULL);
   }
 
+  pad->is_sparse = TRUE;
+
   return TRUE;
+}
+
+static gint64
+packet_duration_kate (GstOggStream * pad, ogg_packet * packet)
+{
+  gint64 duration;
+
+  if (packet->bytes < 1)
+    return 0;
+
+  switch (packet->packet[0]) {
+    case 0x00:                 /* text data */
+      if (packet->bytes < 1 + 8 * 2) {
+        duration = 0;
+      } else {
+        duration = GST_READ_UINT64_LE (packet->packet + 1 + 8);
+        if (duration < 0)
+          duration = 0;
+      }
+      break;
+    default:
+      duration = GST_CLOCK_TIME_NONE;
+      break;
+  }
+
+  return duration;
+}
+
+static void
+extract_tags_kate (GstOggStream * pad, ogg_packet * packet)
+{
+  GstTagList *list = NULL;
+
+  if (packet->bytes <= 0)
+    return;
+
+  switch (packet->packet[0]) {
+    case 0x80:{
+      const gchar *canonical;
+      char language[16];
+
+      if (packet->bytes < 64) {
+        GST_WARNING ("Kate ID header packet is less than 64 bytes, ignored");
+        break;
+      }
+
+      /* the language tag is 16 bytes at offset 32, ensure NUL terminator */
+      memcpy (language, packet->packet + 32, 16);
+      language[15] = 0;
+
+      /* language is an ISO 639-1 code or RFC 3066 language code, we
+       * truncate to ISO 639-1 */
+      g_strdelimit (language, NULL, '\0');
+      canonical = gst_tag_get_language_code_iso_639_1 (language);
+      if (canonical) {
+        list = gst_tag_list_new_full (GST_TAG_LANGUAGE_CODE, canonical, NULL);
+      } else {
+        GST_WARNING ("Unknown or invalid language code %s, ignored", language);
+      }
+      break;
+    }
+    case 0x81:
+      tag_list_from_vorbiscomment_packet (packet,
+          (const guint8 *) "\201kate\0\0\0\0", 9, &list);
+      break;
+    default:
+      break;
+  }
+
+  if (list) {
+    if (pad->taglist) {
+      /* ensure the comment packet cannot override the category/language
+         from the identification header */
+      gst_tag_list_insert (pad->taglist, list, GST_TAG_MERGE_KEEP_ALL);
+    } else
+      pad->taglist = list;
+  }
 }
 
 
 /* *INDENT-OFF* */
 /* indent hates our freedoms */
-static const GstOggMap mappers[] = {
+const GstOggMap mappers[] = {
   {
     "\200theora", 7, 42,
     "video/x-theora",
@@ -1567,7 +1823,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_theora,
     is_header_theora,
     packet_duration_constant,
-    NULL
+    NULL,
+    extract_tags_theora
   },
   {
     "\001vorbis", 7, 22,
@@ -1578,7 +1835,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_vorbis,
     packet_duration_vorbis,
-    NULL
+    NULL,
+    extract_tags_vorbis
   },
   {
     "Speex", 5, 80,
@@ -1589,7 +1847,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_count,
     packet_duration_constant,
-    NULL
+    NULL,
+    extract_tags_count
   },
   {
     "PCM     ", 8, 0,
@@ -1599,6 +1858,7 @@ static const GstOggMap mappers[] = {
     NULL,
     NULL,
     is_header_count,
+    NULL,
     NULL,
     NULL
   },
@@ -1611,6 +1871,7 @@ static const GstOggMap mappers[] = {
     NULL,
     is_header_count,
     NULL,
+    NULL,
     NULL
   },
   {
@@ -1621,6 +1882,7 @@ static const GstOggMap mappers[] = {
     granule_to_granulepos_default,
     NULL,
     is_header_count,
+    NULL,
     NULL,
     NULL
   },
@@ -1633,6 +1895,7 @@ static const GstOggMap mappers[] = {
     NULL,
     is_header_true,
     NULL,
+    NULL,
     NULL
   },
   {
@@ -1644,6 +1907,7 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_fLaC,
     packet_duration_flac,
+    NULL,
     NULL
   },
   {
@@ -1655,11 +1919,13 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_flac,
     packet_duration_flac,
-    NULL
+    NULL,
+    extract_tags_flac
   },
   {
     "AnxData", 7, 0,
     "application/octet-stream",
+    NULL,
     NULL,
     NULL,
     NULL,
@@ -1676,7 +1942,8 @@ static const GstOggMap mappers[] = {
     NULL,
     is_header_count,
     packet_duration_constant,
-    NULL
+    NULL,
+    extract_tags_count
   },
   {
     "\200kate\0\0\0", 8, 0,
@@ -1686,8 +1953,9 @@ static const GstOggMap mappers[] = {
     granule_to_granulepos_default,
     NULL,
     is_header_count,
+    packet_duration_kate,
     NULL,
-    NULL
+    extract_tags_kate
   },
   {
     "BBCD\0", 5, 13,
@@ -1698,7 +1966,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_dirac,
     is_header_count,
     packet_duration_constant,
-    granulepos_to_key_granule_dirac
+    granulepos_to_key_granule_dirac,
+    NULL
   },
   {
     "OVP80\1\1", 7, 4,
@@ -1709,7 +1978,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_vp8,
     is_header_vp8,
     packet_duration_vp8,
-    granulepos_to_key_granule_vp8
+    granulepos_to_key_granule_vp8,
+    extract_tags_vp8
   },
   {
     "\001audio\0\0\0", 9, 53,
@@ -1720,6 +1990,7 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_ogm,
     packet_duration_ogm,
+    NULL,
     NULL
   },
   {
@@ -1731,6 +2002,7 @@ static const GstOggMap mappers[] = {
     NULL,
     is_header_ogm,
     packet_duration_constant,
+    NULL,
     NULL
   },
   {
@@ -1742,7 +2014,8 @@ static const GstOggMap mappers[] = {
     is_keyframe_true,
     is_header_ogm,
     packet_duration_ogm,
-    NULL
+    NULL,
+    extract_tags_ogm
   }
 };
 /* *INDENT-ON* */
@@ -1777,4 +2050,59 @@ gst_ogg_stream_setup_map (GstOggStream * pad, ogg_packet * packet)
   }
 
   return FALSE;
+}
+
+gboolean
+gst_ogg_stream_setup_map_from_caps_headers (GstOggStream * pad,
+    const GstCaps * caps)
+{
+  const GstStructure *structure;
+  const GstBuffer *buf;
+  const GValue *streamheader;
+  const GValue *first_element;
+  ogg_packet packet;
+
+  GST_INFO ("Checking streamheader on caps %" GST_PTR_FORMAT, caps);
+
+  if (caps == NULL)
+    return FALSE;
+
+  structure = gst_caps_get_structure (caps, 0);
+  streamheader = gst_structure_get_value (structure, "streamheader");
+
+  if (streamheader == NULL) {
+    GST_LOG ("no streamheader field in caps %" GST_PTR_FORMAT, caps);
+    return FALSE;
+  }
+
+  if (!GST_VALUE_HOLDS_ARRAY (streamheader)) {
+    GST_ERROR ("streamheader field not an array, caps: %" GST_PTR_FORMAT, caps);
+    return FALSE;
+  }
+
+  if (gst_value_array_get_size (streamheader) == 0) {
+    GST_ERROR ("empty streamheader field in caps %" GST_PTR_FORMAT, caps);
+    return FALSE;
+  }
+
+  first_element = gst_value_array_get_value (streamheader, 0);
+
+  if (!GST_VALUE_HOLDS_BUFFER (first_element)) {
+    GST_ERROR ("first streamheader not a buffer, caps: %" GST_PTR_FORMAT, caps);
+    return FALSE;
+  }
+
+  buf = gst_value_get_buffer (first_element);
+  if (buf == NULL || GST_BUFFER_SIZE (buf) == 0) {
+    GST_ERROR ("invalid first streamheader buffer");
+    return FALSE;
+  }
+
+  GST_MEMDUMP ("streamheader", GST_BUFFER_DATA (buf), GST_BUFFER_SIZE (buf));
+
+  packet.packet = GST_BUFFER_DATA (buf);
+  packet.bytes = GST_BUFFER_SIZE (buf);
+
+  GST_INFO ("Found headers on caps, using those to determine type");
+  return gst_ogg_stream_setup_map (pad, &packet);
 }

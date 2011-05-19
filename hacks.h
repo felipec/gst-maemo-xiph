@@ -9,11 +9,18 @@
 #ifndef HACKS_H
 #define HACKS_H
 
+#include <gst/base/gstbitreader.h>
+
+#if !GST_CHECK_VERSION(0,10,28)
 #define GST_FLOW_CUSTOM_SUCCESS_1 101
+#endif
+
+#if !GST_CHECK_VERSION(0,10,29)
 #define GST_TRACE_OBJECT(obj,...) GST_CAT_LEVEL_LOG (GST_CAT_DEFAULT, GST_LEVEL_TRACE, obj, __VA_ARGS__)
 #define GST_TRACE(...) GST_CAT_LEVEL_LOG (GST_CAT_DEFAULT, GST_LEVEL_TRACE, NULL, __VA_ARGS__)
+#endif
 
-#include <gst/base/gstbitreader.h>
+#if !GST_CHECK_VERSION(0,10,30)
 
 static inline void
 gst_bit_reader_skip_unchecked (GstBitReader * reader, guint nbits)
@@ -70,5 +77,7 @@ __GST_BIT_READER_READ_BITS_UNCHECKED (32)
 __GST_BIT_READER_READ_BITS_UNCHECKED (64)
 
 #undef __GST_BIT_READER_READ_BITS_UNCHECKED
+
+#endif
 
 #endif

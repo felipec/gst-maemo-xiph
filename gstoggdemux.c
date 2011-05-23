@@ -3627,7 +3627,7 @@ gst_ogg_demux_plugin_init (GstPlugin * plugin)
   bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
 #endif
 
-  return gst_element_register (plugin, "oggdemux", GST_RANK_PRIMARY,
+  return gst_element_register (plugin, "oggdemux-xiph", GST_RANK_PRIMARY + 1,
       GST_TYPE_OGG_DEMUX);
 }
 

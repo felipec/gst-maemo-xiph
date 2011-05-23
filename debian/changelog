@@ -1,3 +1,9 @@
+gst-maemo-xiph (0.5-2) fremantle; urgency=low
+
+  * Rename 'oggdemux' to 'oggdemux-xiph'
+
+ -- Felipe Contreras <felipe.contreras@gmail.com>  Mon, 23 May 2011 17:22:05 +0300
+
 gst-maemo-xiph (0.5-1) fremantle; urgency=low
 
   * Rename plugin to 'xiph' to avoid conflicts

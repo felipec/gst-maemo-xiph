@@ -19,7 +19,7 @@ plugin_init(GstPlugin *plugin)
 GstPluginDesc gst_plugin_desc = {
 	.major_version = 0,
 	.minor_version = 10,
-	.name = "ogg",
+	.name = "xiph",
 	.description = (gchar *) "ogg/flac demuxing/parsing",
 	.plugin_init = plugin_init,
 	.version = VERSION,

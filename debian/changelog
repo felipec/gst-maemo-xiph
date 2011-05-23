@@ -1,3 +1,9 @@
+gst-maemo-xiph (0.5-1) fremantle; urgency=low
+
+  * Rename plugin to 'xiph' to avoid conflicts
+
+ -- Felipe Contreras <felipe.contreras@gmail.com>  Mon, 23 May 2011 16:48:45 +0300
+
 gst-maemo-xiph (0.5) fremantle; urgency=low
 
   * Synchronize with upstream, even more

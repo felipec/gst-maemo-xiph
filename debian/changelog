@@ -1,3 +1,9 @@
+gst-maemo-xiph (0.5-3) fremantle; urgency=low
+
+  * Maemo-optify
+
+ -- Felipe Contreras <felipe.contreras@gmail.com>  Sat, 04 Jun 2011 08:46:30 +0300
+
 gst-maemo-xiph (0.5-2) fremantle; urgency=low
 
   * Rename 'oggdemux' to 'oggdemux-xiph'
